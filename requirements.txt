@@ -1,0 +1,5 @@
+baostock>=0.9.4
+pandas>=2.0
+matplotlib>=3.7
+streamlit>=1.30
+requests>=2.31
