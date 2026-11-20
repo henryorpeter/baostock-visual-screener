@@ -1,5 +1,28 @@
 # A股量化策略选股终端（Baostock Visual Screener）
 
+<p align="center">
+  <a href="https://github.com/henryorpeter/baostock-visual-screener/stargazers">
+    <img src="https://img.shields.io/github/stars/henryorpeter/baostock-visual-screener?style=for-the-badge&logo=star&logoColor=white&color=ffb703" alt="GitHub stars" />
+  </a>
+  <a href="https://github.com/henryorpeter/baostock-visual-screener/network/members">
+    <img src="https://img.shields.io/github/forks/henryorpeter/baostock-visual-screener?style=for-the-badge&logo=git&logoColor=white&color=0284c7" alt="GitHub forks" />
+  </a>
+  <a href="https://www.python.org/">
+    <img src="https://img.shields.io/badge/Python-3.10%2B-3776ab?style=for-the-badge&logo=python&logoColor=white" alt="Python 3.10+" />
+  </a>
+  <a href="https://streamlit.io/">
+    <img src="https://img.shields.io/badge/Streamlit-1.30%2B-ff4b4b?style=for-the-badge&logo=streamlit&logoColor=white" alt="Streamlit" />
+  </a>
+  <a href="https://opensource.org/licenses/MIT">
+    <img src="https://img.shields.io/badge/License-MIT-10b981?style=for-the-badge" alt="License" />
+  </a>
+</p>
+
+> 🌟 **如果这个项目对你的量化研究、形态选股或 Python 可视化有所启发，请动动手指在右上角点一个 Star ⭐️ 吧！**  
+> 你的每一个 Star 都是作者持续优化代码、新增经典战法与维护数据接口的最大动力！欢迎点击上方按钮或仓库右上角加星关注更新 ↗️
+
+---
+
 基于 **Streamlit + Ant Design (`streamlit-antd-components`) + TradingView Lightweight Charts** 构建的 A 股本地化可视化选股终端。支持全市场历史日线本地 SQLite 缓存、20 套经典技术形态策略实时扫描、交互式信号榜与专业多周期 K 线看盘。
 
 > **免责声明**：本工具仅供量化学习与技术形态研究参考，不构成任何投资建议。
@@ -236,6 +259,20 @@ baostock-visual-screener/
   A：部分刚停牌、退市整理期或接口瞬时限流的标的可能单次拉取失败，可在「数据源与缓存中心」查看失败明细，再次点击「更新全市场行情缓存」会自动跳过已完成项、仅重试缺失标的。
 - **Q：页面显示不是暗黑主题怎么办？**  
   A：请确认项目根目录下存在 `.streamlit/config.toml` 文件，并且是在项目根目录执行 `streamlit run baostock_screener.py` 启动。
+
+---
+
+## ⭐️ 欢迎 Star 与社区共建
+
+开源不易，如果这个小工具对您有所帮助或带来了启发：
+- 请在右上角点击一下 **Star ⭐️** 支持我们，让更多量化与股票投资爱好者看到这个项目！
+- 如果您有新的量化战法、技术指标或改进建议，非常欢迎提交 [Issues](https://github.com/henryorpeter/baostock-visual-screener/issues) 或 Pull Requests 共同共建！
+
+<p align="center">
+  <a href="https://star-history.com/#henryorpeter/baostock-visual-screener&Date">
+    <img src="https://api.star-history.com/svg?repos=henryorpeter/baostock-visual-screener&type=Date" alt="Star History Chart" style="max-width: 100%;" />
+  </a>
+</p>
 
 ---
 
