@@ -1,20 +1,238 @@
-# Baostock 可视化选股
+# A股量化策略选股终端（Baostock Visual Screener）
 
-## 安装运行
+基于 **Streamlit + Ant Design (`streamlit-antd-components`) + TradingView Lightweight Charts** 构建的 A 股本地化可视化选股终端。支持全市场历史日线本地 SQLite 缓存、20 套经典技术形态策略实时扫描、交互式信号榜与专业多周期 K 线看盘。
 
-在本目录打开 PowerShell：
+> **免责声明**：本工具仅供量化学习与技术形态研究参考，不构成任何投资建议。
 
-```powershell
-py -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install -r requirements.txt
-streamlit run baostock_screener.py
+---
+
+## 核心特性
+
+- **专业暗黑金融终端 UI**：内置 `.streamlit/config.toml` 深色主题与自定义终端风格样式，集成 Ant Design 导航栏、分段控制器与标签筛选，信息层次清晰。
+- **全市场离线缓存引擎**：行情自动落盘至本地 `stock_cache.sqlite3`，首次全量同步后日常选股完全离线运行、毫秒级响应；后续更新自动跳过已缓存区间，仅增量补齐近期数据。
+- **三级行情数据源容灾**：
+  1. **主通道**：Baostock 证券宝前复权日线（含开高低收、成交量、成交额、换手率、涨跌幅、ST 标识）。
+  2. **列表备用**：Baostock 受限时自动切换同花顺 HTTPS 或腾讯实时接口核验 A 股股票池。
+  3. **日线并发补齐**：主通道失败的标的自动通过腾讯财经 HTTPS 6 路线程并发回补。
+- **实时悬浮进度反馈**：选股扫描与行情同步均配有居中悬浮实时进度面板，清晰展示当前阶段、百分比、耗时、已扫描数量与实时命中条数。
+- **交互式信号榜 + 专业图表联动**：
+  - 信号表内置 **A 股红涨绿跌高亮**、**换手率进度条**、**近 20 日迷你走势折线图（Sparkline）**，支持策略标签过滤、代码/名称搜索与 UTF-8 CSV 导出。
+  - **点击表格任意一行**直接联动下方个股终端，支持「上一只 / 下一只」快速翻阅。
+  - 集成 **TradingView Lightweight Charts v5**，支持日线 / 周线 / 月线切换、MA5/10/20/30 均线、成交量及可开关的 **MACD (12, 26, 9)** 副图。
+- **20 套技术策略矩阵**：按「趋势突破 / 涨停战法 / 均线共振 / 形态反转」四大流派归类，支持一键应用流派组合或自由多选。
+
+---
+
+## 项目目录结构
+
+```text
+baostock-visual-screener/
+├── .streamlit/
+│   └── config.toml          # Streamlit 暗黑金融终端原生主题配置
+├── baostock_screener.py     # 主程序（数据抓取、缓存、策略引擎与可视化界面）
+├── requirements.txt         # Python 依赖清单
+├── stock_cache.sqlite3      # 本地行情缓存库（首次运行更新后自动生成，已加入 .gitignore）
+└── README.md                # 项目说明与手动部署文档
 ```
 
-首次点击侧栏“更新全市场行情缓存”。行情写入脚本旁的 `stock_cache.sqlite3`；这次全量更新需要等待并显示进度。随后点击“开始本地选股”，扫描只从 SQLite 读取。之后再次更新会跳过已缓存区间，只补近期行情；缓存文件也可复制到其他电脑继续使用。
+---
 
-行情优先走 Baostock 单连接；连接失败的股票通过腾讯 HTTPS 最多 6 路并发补齐。股票列表依次尝试 Baostock、同花顺 HTTPS、腾讯 HTTPS 实时报价核验。页面会显示更新、跳过、失败和有效缓存数量；更新失败项可再次重试。
+## 手动部署操作说明
 
-如果所在网络无法访问 Baostock 的 `public-api.baostock.com:10030`，工具会切换 HTTPS 数据源。备用源仍需要能访问同花顺或腾讯财经域名。缓存齐备后，日常选股过程不访问行情网络。腾讯备用日线没有换手率，换手率数据会留空，相关换手率条件自动跳过。
+### 环境要求
 
-默认扫描上限为 6,000 只；可调小以缩短本地计算时间。支持多选策略、查看走势图和导出 CSV。Sequoia-X 参考策略包括海龟突破、高旗形整理、涨停洗盘、上升趋势跌停反包、RPS 强势突破；RPS 按本次扫描样本排名。图表采用 [TradingView Lightweight Charts](https://github.com/locupleto/streamlit-lightweight-charts-v5) Streamlit 组件，提供日/周/月 K 线、MA5/10/20/30、成交量和拖拽缩放。微信推送功能暂时从界面隐藏。
+- **Python**：建议 `3.10` ~ `3.13`
+- **网络**：首次拉取行情需可访问 Baostock（`public-api.baostock.com:10030`）或同花顺 / 腾讯财经 HTTPS 域名；缓存建立完成后日常选股可离线使用。
+
+---
+
+### 方式一：Windows 本地手动部署（PowerShell）
+
+1. **克隆项目并进入目录**
+
+   ```powershell
+   git clone https://github.com/henryorpeter/baostock-visual-screener.git
+   cd baostock-visual-screener
+   ```
+
+2. **创建并激活 Python 虚拟环境**
+
+   ```powershell
+   py -m venv .venv
+   .\.venv\Scripts\Activate.ps1
+   ```
+
+   > 若提示 PowerShell 执行策略禁止运行脚本，可先执行一次：
+   > ```powershell
+   > Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
+   > ```
+
+3. **安装依赖包**
+
+   ```powershell
+   python -m pip install --upgrade pip
+   python -m pip install -r requirements.txt
+   ```
+
+   > 如国内下载较慢，可临时指定清华源：
+   > ```powershell
+   > python -m pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+   > ```
+
+4. **启动应用**
+
+   ```powershell
+   streamlit run baostock_screener.py
+   ```
+
+   启动后浏览器将自动打开 `http://localhost:8501`。如需指定端口：
+
+   ```powershell
+   streamlit run baostock_screener.py --server.port 8502
+   ```
+
+---
+
+### 方式二：macOS / Linux 本地手动部署
+
+1. **克隆代码**
+
+   ```bash
+   git clone https://github.com/henryorpeter/baostock-visual-screener.git
+   cd baostock-visual-screener
+   ```
+
+2. **创建并激活虚拟环境**
+
+   ```bash
+   python3 -m venv .venv
+   source .venv/bin/activate
+   ```
+
+3. **安装依赖并启动**
+
+   ```bash
+   pip install --upgrade pip
+   pip install -r requirements.txt
+   streamlit run baostock_screener.py
+   ```
+
+   在浏览器访问 `http://localhost:8501` 即可。
+
+---
+
+### 方式三：Linux 服务器手动后台部署（长期运行 / 局域网访问）
+
+适合部署在云服务器、NAS 或内网 Linux 主机上，通过浏览器远程访问。
+
+1. **准备环境与依赖**
+
+   ```bash
+   git clone https://github.com/henryorpeter/baostock-visual-screener.git /opt/baostock-visual-screener
+   cd /opt/baostock-visual-screener
+   python3 -m venv .venv
+   ./.venv/bin/pip install --upgrade pip
+   ./.venv/bin/pip install -r requirements.txt
+   ```
+
+2. **快速后台启动（`nohup` 方式）**
+
+   ```bash
+   nohup ./.venv/bin/streamlit run baostock_screener.py \
+     --server.address 0.0.0.0 \
+     --server.port 8501 \
+     --server.headless true \
+     > screener.log 2>&1 &
+   ```
+
+   查看日志：
+
+   ```bash
+   tail -f screener.log
+   ```
+
+3. **生产推荐：`systemd` 守护进程托管（开机自启 + 异常自动拉起）**
+
+   新建服务文件 `/etc/systemd/system/baostock-screener.service`：
+
+   ```ini
+   [Unit]
+   Description=Baostock Visual Stock Screener
+   After=network.target
+
+   [Service]
+   Type=simple
+   User=root
+   WorkingDirectory=/opt/baostock-visual-screener
+   ExecStart=/opt/baostock-visual-screener/.venv/bin/streamlit run baostock_screener.py --server.address 0.0.0.0 --server.port 8501 --server.headless true
+   Restart=always
+   RestartSec=5
+
+   [Install]
+   WantedBy=multi-user.target
+   ```
+
+   启用并启动服务：
+
+   ```bash
+   sudo systemctl daemon-reload
+   sudo systemctl enable --now baostock-screener
+   sudo systemctl status baostock-screener
+   ```
+
+4. **防火墙与反向代理提示**
+   - 若直接通过 `http://<服务器IP>:8501` 访问，请在系统防火墙及云厂商安全组放行 `8501/TCP` 端口。
+   - 若通过 **Nginx** 反向代理域名访问，务必开启 WebSocket 转发（Streamlit 依赖 `/_stcore/stream` 长连接）：
+
+     ```nginx
+     location / {
+         proxy_pass http://127.0.0.1:8501;
+         proxy_http_version 1.1;
+         proxy_set_header Upgrade $http_upgrade;
+         proxy_set_header Connection "upgrade";
+         proxy_set_header Host $host;
+         proxy_read_timeout 86400;
+     }
+     ```
+
+---
+
+### 离线行情缓存跨机迁移
+
+本地行情完整存储在项目根目录的 `stock_cache.sqlite3` 单文件中。如果你已在某台电脑完成全市场同步，只需直接将该文件复制到另一台机器的同级目录，重启应用即可免等待直接使用。
+
+---
+
+## 日常使用指南
+
+1. **首次同步行情缓存**
+   - 在左侧「选股控制台」选定日期区间（默认近 180 天，可一键切换近 90 天 / 180 天 / 1 年）。
+   - 点击 **「更新全市场行情缓存」**，等待悬浮进度面板同步完成（首次全量拉取约需数分钟；之后每次仅增量补齐最新交易日）。
+2. **配置策略与过滤条件**
+   - 在侧边栏一键套用流派预设（趋势突破 / 涨停战法 / 均线共振 / 形态反转），或在下拉框中自由多选策略，也可进入 **「策略百科矩阵」** 浏览全部 20 套策略逻辑。
+   - 按需设置最低涨跌幅、换手率区间滑块与扫描股票上限（默认 6,000 只）。
+3. **执行本地选股与看盘分析**
+   - 点击 **「开始本地选股」**（或主界面的 **「立即开始本地选股」**），界面居中弹出实时进度面板。
+   - 扫描完成后可在 **「策略信号榜」** 中按策略标签或关键字筛选、导出 CSV；点击表格中任意一行即可在下方 **「个股深度行情终端」** 查看多周期 K 线、MA 均线、成交量及 MACD 副图。
+
+---
+
+## 内置 20 套选股策略一览
+
+| 策略流派 | 包含策略 | 核心思路 |
+| :--- | :--- | :--- |
+| **趋势突破** | 海龟突破策略、阻力位突破策略、高旗形整理策略、趋势加速拐点、趋势起点策略、RPS强势突破 | 捕捉前高放量突破、高位收敛缩量蓄势、均线加速及 120 日相对强度前 10% 领涨股 |
+| **涨停战法** | 涨停回马枪策略、涨停横盘策略、涨停洗盘策略、强势洗盘弱转强、上升趋势跌停反包 | 围绕近期涨停基因、缩量回踩支撑、窄幅横盘突破及强势洗盘反包机会 |
+| **均线共振** | 多金叉共振、2560战法、金三角策略、金叉不绿策略 | MA / 均量 / MACD / KDJ 多维度金叉共振与阳线确认 |
+| **形态反转** | 底部趋势拐点、启明星策略、多方炮策略、仙人指路策略、W底策略 | 识别深跌超卖拐点、启明星、两阳夹一阴、长上影试盘与双底颈线突破 |
+
+---
+
+## 常见问题（FAQ）
+
+- **Q：提示 Baostock 连接失败怎么办？**  
+  A：若当前网络无法直连 `public-api.baostock.com:10030`，程序会自动切换至同花顺 / 腾讯财经 HTTPS 备用源补齐行情。需注意腾讯备用源日线不包含换手率字段，对应股票的换手率将留空并在选股时自动跳过换手率条件。
+- **Q：为什么缓存更新完成后仍有少量失败项？**  
+  A：部分刚停牌、退市整理期或接口瞬时限流的标的可能单次拉取失败，可在「数据源与缓存中心」查看失败明细，再次点击「更新全市场行情缓存」会自动跳过已完成项、仅重试缺失标的。
+- **Q：页面显示不是暗黑主题怎么办？**  
+  A：请确认项目根目录下存在 `.streamlit/config.toml` 文件，并且是在项目根目录执行 `streamlit run baostock_screener.py` 启动。

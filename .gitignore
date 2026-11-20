@@ -2,5 +2,6 @@
 __pycache__/
 *.py[cod]
 stock_cache.sqlite3
+stock_cache.sqlite3-*
 .env
 .streamlit/secrets.toml
