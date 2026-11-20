@@ -10,9 +10,10 @@ import time
 import requests
 
 import baostock as bs
-import matplotlib.pyplot as plt
 import pandas as pd
+import plotly.graph_objects as go
 import streamlit as st
+from plotly.subplots import make_subplots
 
 
 DAILY_FIELDS = "date,code,open,high,low,close,volume,amount,turn,pctChg,isST"
@@ -538,9 +539,67 @@ def push_wechat(result, sendkey, strategy_names):
         raise RuntimeError(payload.get("message", "Server酱推送失败"))
 
 
+def price_figure(frame, code):
+    d = frame.copy().sort_values("date")
+    for window in (5, 10, 20, 30):
+        d[f"ma{window}"] = d.close.rolling(window).mean()
+    figure = make_subplots(
+        rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.035,
+        row_heights=[0.76, 0.24],
+    )
+    figure.add_trace(go.Candlestick(
+        x=d.date, open=d.open, high=d.high, low=d.low, close=d.close,
+        name="日K", increasing_line_color="#f05252", decreasing_line_color="#22a06b",
+        increasing_fillcolor="#f05252", decreasing_fillcolor="#22a06b",
+    ), row=1, col=1)
+    ma_colors = {5: "#f2c94c", 10: "#4da3ff", 20: "#bd83f2", 30: "#f29979"}
+    for window, color in ma_colors.items():
+        figure.add_trace(go.Scatter(
+            x=d.date, y=d[f"ma{window}"], mode="lines", name=f"MA{window}",
+            line={"color": color, "width": 1.25},
+        ), row=1, col=1)
+    volume_colors = ["#f05252" if close >= open_ else "#22a06b"
+                     for open_, close in zip(d.open, d.close)]
+    figure.add_trace(go.Bar(
+        x=d.date, y=d.volume, marker_color=volume_colors, name="成交量",
+        hovertemplate="%{x|%Y-%m-%d}<br>成交量 %{y:,.0f}<extra></extra>",
+    ), row=2, col=1)
+    figure.update_layout(
+        title={"text": f"{code} · 日K走势", "x": 0.015, "xanchor": "left"},
+        template="plotly_dark", height=660, margin={"l": 12, "r": 12, "t": 58, "b": 8},
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        font={"family": "Microsoft YaHei, sans-serif", "color": "#cbd5e1"},
+        legend={"orientation": "h", "y": 1.04, "x": 0.99, "xanchor": "right"},
+        hovermode="x unified", xaxis_rangeslider_visible=True,
+        xaxis_rangeslider={"thickness": 0.09, "bgcolor": "#18212d"},
+        xaxis_rangeslider_yaxis_rangemode="match",
+    )
+    figure.update_xaxes(showgrid=False, linecolor="#344154", rangeslider_bgcolor="#18212d")
+    figure.update_yaxes(showgrid=True, gridcolor="#263244", zeroline=False, row=1, col=1)
+    figure.update_yaxes(showgrid=False, title_text="成交量", row=2, col=1)
+    return figure
+
+
 st.set_page_config(page_title="Baostock 选股", layout="wide")
-st.title("Baostock A股可视化选股")
-st.caption("优先使用 Baostock；连接失败时依次使用同花顺或腾讯股票列表，并以腾讯 HTTPS 获取日线。可多选策略、查看价格走势并导出结果。仅供研究参考。")
+st.markdown("""
+<style>
+.stApp { background: #0b111a; color: #e6edf5; }
+[data-testid="stHeader"] { background: rgba(11,17,26,.9); }
+[data-testid="stSidebar"] { background: #101925; border-right: 1px solid #202c3b; }
+[data-testid="stSidebar"] h1, [data-testid="stSidebar"] h2, [data-testid="stSidebar"] h3 { color: #e6edf5; }
+h1, h2, h3 { letter-spacing: -.025em; }
+[data-testid="stMetric"] { background: #111b28; border: 1px solid #243246; border-radius: 10px; padding: 14px 16px; }
+[data-testid="stMetricLabel"] { color: #8fa2b8; }
+[data-testid="stMetricValue"] { color: #f1f5f9; }
+[data-testid="stDataFrame"] { border: 1px solid #243246; border-radius: 10px; overflow: hidden; }
+.stButton > button, .stDownloadButton > button { border-radius: 8px; border: 1px solid #33445b; }
+.stButton > button[kind="primary"] { background: #c53b42; border-color: #c53b42; }
+.stButton > button[kind="primary"]:hover { background: #df494f; border-color: #df494f; }
+div[data-testid="stVerticalBlock"] div[data-testid="stMarkdownContainer"] p { color: #9aacc0; }
+</style>
+""", unsafe_allow_html=True)
+st.title("A股策略选股终端")
+st.caption("本地行情缓存 · 多策略扫描 · 日K技术图表　|　仅供研究参考")
 
 today = date.today()
 with st.sidebar:
@@ -553,12 +612,11 @@ with st.sidebar:
     max_turn = st.number_input("最高换手率 (%)", 0.0, 100.0, 100.0, 0.1)
     max_stocks = st.number_input("最多扫描股票数", 10, 6000, 6000, 100)
     st.divider()
-    st.subheader("微信推送")
-    sendkey = st.text_input("Server酱 SendKey", type="password", help="在 sct.ftqq.com 获取，绑定微信后填写")
     update = st.button("更新全市场行情缓存", use_container_width=True)
     run = st.button("开始本地选股", type="primary", use_container_width=True)
 
-st.caption("策略逻辑：" + "；".join(f"{s}：{STRATEGIES[s]}" for s in strategies) + "。基于日线 OHLCV 规则识别。")
+with st.expander("当前策略说明", expanded=False):
+    st.write("；".join(f"{s}：{STRATEGIES[s]}" for s in strategies) + "。信号基于日线 OHLCV 规则识别。")
 
 if start >= end:
     st.error("开始日期必须早于结束日期")
@@ -617,10 +675,12 @@ if run:
 
 result = st.session_state.get("result")
 local_status = cache_status()
-st.caption(f"本地行情缓存：{local_status['stocks']} 只股票 / {local_status['rows']:,} 条日线；最新日期 {local_status['newest'] or '暂无'}。")
+stock_count, row_count = st.columns(2)
+stock_count.metric("缓存股票", f"{local_status['stocks']:,} 只")
+row_count.metric("日线记录", f"{local_status['rows']:,} 条", help=f"最新行情日期：{local_status['newest'] or '暂无'}")
 if "scan_count" in st.session_state:
     scanned, attempted, total = st.session_state["scan_count"]
-    st.caption(f"本次有效数据 {scanned} / 尝试 {attempted} / 全市场 {total} 只。")
+    st.caption(f"本次扫描：有效数据 {scanned:,} / 已选 {attempted:,} / 股票池 {total:,} 只。")
 if "update_stats" in st.session_state:
     u = st.session_state["update_stats"]
     q = st.session_state.get("scan_stats", {})
@@ -628,25 +688,22 @@ if "update_stats" in st.session_state:
 if result is None:
     st.info("首次使用先更新全市场行情缓存；之后选股只读本地数据。")
 else:
-    st.subheader(f"筛选结果（{len(result)} 只）")
-    st.caption(f"行情源：{st.session_state.get('history_source', 'Baostock')}")
-    st.dataframe(result, use_container_width=True, hide_index=True)
-    if st.button("推送到微信", use_container_width=True):
-        try:
-            push_wechat(result, sendkey, st.session_state.get("strategies", strategies))
-            st.success("微信推送已发送")
-        except Exception as exc:
-            st.error(f"微信推送失败：{exc}")
+    st.subheader(f"策略信号　{len(result)} 只")
+    st.caption(f"行情源：{st.session_state.get('history_source', 'Baostock')}　·　结果按当日涨幅排序")
+    st.dataframe(result, use_container_width=True, hide_index=True, height=310)
+    st.download_button("导出筛选结果 CSV", result.to_csv(index=False).encode("utf-8-sig"), "baostock_screen.csv", "text/csv")
     if not result.empty:
-        choice = st.selectbox("查看个股走势", result["代码"].tolist())
+        st.subheader("个股行情分析")
+        choice = st.selectbox("选择股票查看日K", result["代码"].tolist(), label_visibility="collapsed")
         start_date, end_date = st.session_state["range"]
         frame = _cache_read(choice, start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d"))
-        frame["MA20"] = frame.close.rolling(20).mean()
-        fig, ax = plt.subplots(figsize=(12, 4))
-        ax.plot(frame.date, frame.close, label="收盘价")
-        ax.plot(frame.date, frame.MA20, label="MA20")
-        ax.set_title(f"{choice} · MA20")
-        ax.grid(alpha=.25)
-        ax.legend()
-        st.pyplot(fig, clear_figure=True)
-        st.download_button("下载筛选结果 CSV", result.to_csv(index=False).encode("utf-8-sig"), "baostock_screen.csv", "text/csv")
+        if not frame.empty:
+            latest = frame.iloc[-1]
+            prior = frame.iloc[-2].close if len(frame) > 1 else latest.close
+            change = (latest.close / prior - 1) * 100 if prior else 0
+            quote_columns = st.columns(4)
+            quote_columns[0].metric("收盘价", f"{latest.close:.2f}", f"{change:+.2f}%")
+            quote_columns[1].metric("最高", f"{latest.high:.2f}")
+            quote_columns[2].metric("最低", f"{latest.low:.2f}")
+            quote_columns[3].metric("成交量", f"{latest.volume:,.0f}")
+            st.plotly_chart(price_figure(frame, choice), use_container_width=True, config={"displaylogo": False, "scrollZoom": True})
