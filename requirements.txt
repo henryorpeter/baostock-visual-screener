@@ -1,5 +1,5 @@
 baostock>=0.9.4
 pandas>=2.0
-plotly>=5.18
+streamlit-lightweight-charts-v5>=0.2.0
 streamlit>=1.30
 requests>=2.31

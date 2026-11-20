@@ -11,9 +11,8 @@ import requests
 
 import baostock as bs
 import pandas as pd
-import plotly.graph_objects as go
 import streamlit as st
-from plotly.subplots import make_subplots
+from lightweight_charts_v5 import lightweight_charts_v5_component
 
 
 DAILY_FIELDS = "date,code,open,high,low,close,volume,amount,turn,pctChg,isST"
@@ -539,63 +538,84 @@ def push_wechat(result, sendkey, strategy_names):
         raise RuntimeError(payload.get("message", "Server酱推送失败"))
 
 
-def price_figure(frame, code):
-    d = frame.copy().sort_values("date")
+def chart_panes(frame, title, interval):
+    d = frame.copy().sort_values("date").dropna(subset=["open", "high", "low", "close"])
+    d["volume"] = pd.to_numeric(d.volume, errors="coerce").fillna(0)
+    if interval == "周线":
+        period = d.date.dt.to_period("W-FRI")
+    elif interval == "月线":
+        period = d.date.dt.to_period("M")
+    else:
+        period = None
+    if period is not None:
+        d = d.groupby(period, sort=True).agg(
+            date=("date", "last"), open=("open", "first"), high=("high", "max"),
+            low=("low", "min"), close=("close", "last"), volume=("volume", "sum"),
+        ).reset_index(drop=True)
     for window in (5, 10, 20, 30):
         d[f"ma{window}"] = d.close.rolling(window).mean()
-    figure = make_subplots(
-        rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.035,
-        row_heights=[0.76, 0.24],
-    )
-    figure.add_trace(go.Candlestick(
-        x=d.date, open=d.open, high=d.high, low=d.low, close=d.close,
-        name="日K", increasing_line_color="#f05252", decreasing_line_color="#22a06b",
-        increasing_fillcolor="#f05252", decreasing_fillcolor="#22a06b",
-    ), row=1, col=1)
-    ma_colors = {5: "#f2c94c", 10: "#4da3ff", 20: "#bd83f2", 30: "#f29979"}
+    d["time"] = pd.to_datetime(d.date).dt.strftime("%Y-%m-%d")
+    up, down = "#f05252", "#24b47e"
+    theme = {
+        "layout": {"background": {"color": "#0d141e"}, "textColor": "#91a0b3",
+                   "fontFamily": "Microsoft YaHei, sans-serif", "fontSize": 12},
+        "grid": {"vertLines": {"color": "#172230"}, "horzLines": {"color": "#172230"}},
+        "rightPriceScale": {"borderColor": "#293547"},
+        "timeScale": {"borderColor": "#293547", "timeVisible": False,
+                      "rightOffset": 4, "barSpacing": 8},
+        "crosshair": {"mode": "normal", "vertLine": {"color": "#64748b", "style": 2, "width": 1},
+                      "horzLine": {"color": "#64748b", "style": 2, "width": 1}},
+    }
+    candles = d[["time", "open", "high", "low", "close"]].to_dict("records")
+    price_series = [{
+        "type": "Candlestick", "data": candles,
+        "options": {"upColor": up, "downColor": down, "borderVisible": False,
+                    "wickUpColor": up, "wickDownColor": down, "priceLineVisible": True},
+    }]
+    ma_colors = {5: "#e9bd4f", 10: "#5ba8ff", 20: "#b28cf3", 30: "#f0926b"}
     for window, color in ma_colors.items():
-        figure.add_trace(go.Scatter(
-            x=d.date, y=d[f"ma{window}"], mode="lines", name=f"MA{window}",
-            line={"color": color, "width": 1.25},
-        ), row=1, col=1)
-    volume_colors = ["#f05252" if close >= open_ else "#22a06b"
-                     for open_, close in zip(d.open, d.close)]
-    figure.add_trace(go.Bar(
-        x=d.date, y=d.volume, marker_color=volume_colors, name="成交量",
-        hovertemplate="%{x|%Y-%m-%d}<br>成交量 %{y:,.0f}<extra></extra>",
-    ), row=2, col=1)
-    figure.update_layout(
-        title={"text": f"{code} · 日K走势", "x": 0.015, "xanchor": "left"},
-        template="plotly_dark", height=660, margin={"l": 12, "r": 12, "t": 58, "b": 8},
-        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-        font={"family": "Microsoft YaHei, sans-serif", "color": "#cbd5e1"},
-        legend={"orientation": "h", "y": 1.04, "x": 0.99, "xanchor": "right"},
-        hovermode="x unified", xaxis_rangeslider_visible=True,
-        xaxis_rangeslider={"thickness": 0.09, "bgcolor": "#18212d"},
-        xaxis_rangeslider_yaxis_rangemode="match",
-    )
-    figure.update_xaxes(showgrid=False, linecolor="#344154", rangeslider_bgcolor="#18212d")
-    figure.update_yaxes(showgrid=True, gridcolor="#263244", zeroline=False, row=1, col=1)
-    figure.update_yaxes(showgrid=False, title_text="成交量", row=2, col=1)
-    return figure
+        values = d[["time", f"ma{window}"]].dropna()
+        price_series.append({
+            "type": "Line",
+            "data": values.rename(columns={f"ma{window}": "value"}).to_dict("records"),
+            "options": {"color": color, "lineWidth": 1, "title": f"MA{window}",
+                        "priceLineVisible": False, "lastValueVisible": False,
+                        "crosshairMarkerVisible": False},
+        })
+    volumes = [{
+        "time": row.time, "value": float(row.volume or 0),
+        "color": f"{up}99" if row.close >= row.open else f"{down}99",
+    } for row in d.itertuples()]
+    return [
+        {"chart": theme, "height": 440, "title": f"{title} · {interval}", "series": price_series},
+        {"chart": theme, "height": 150, "title": "成交量", "series": [{
+            "type": "Histogram", "data": volumes,
+            "options": {"priceFormat": {"type": "volume"}, "priceLineVisible": False},
+        }]},
+    ]
 
 
 st.set_page_config(page_title="Baostock 选股", layout="wide")
 st.markdown("""
 <style>
-.stApp { background: #0b111a; color: #e6edf5; }
+.stApp { background: radial-gradient(ellipse at 50% -20%, #182638 0, #0b111a 55%); color: #e6edf5; }
+[data-testid="stAppViewContainer"] > .main { background: transparent; }
+[data-testid="stMainBlockContainer"] { max-width: 1480px; padding-top: 2rem; }
 [data-testid="stHeader"] { background: rgba(11,17,26,.9); }
 [data-testid="stSidebar"] { background: #101925; border-right: 1px solid #202c3b; }
 [data-testid="stSidebar"] h1, [data-testid="stSidebar"] h2, [data-testid="stSidebar"] h3 { color: #e6edf5; }
-h1, h2, h3 { letter-spacing: -.025em; }
-[data-testid="stMetric"] { background: #111b28; border: 1px solid #243246; border-radius: 10px; padding: 14px 16px; }
+h1, h2, h3 { letter-spacing: -.025em; color: #edf3fa; }
+h1 { font-size: 2.1rem !important; }
+h2 { font-size: 1.3rem !important; margin-top: 1.5rem; }
+[data-testid="stMetric"] { background: linear-gradient(145deg,#121e2c,#0f1823); border: 1px solid #26364a; border-radius: 10px; padding: 14px 16px; }
 [data-testid="stMetricLabel"] { color: #8fa2b8; }
 [data-testid="stMetricValue"] { color: #f1f5f9; }
-[data-testid="stDataFrame"] { border: 1px solid #243246; border-radius: 10px; overflow: hidden; }
-.stButton > button, .stDownloadButton > button { border-radius: 8px; border: 1px solid #33445b; }
+[data-testid="stDataFrame"] { border: 1px solid #26364a; border-radius: 10px; overflow: hidden; }
+.stButton > button, .stDownloadButton > button { border-radius: 8px; border: 1px solid #33445b; min-height: 2.7rem; }
 .stButton > button[kind="primary"] { background: #c53b42; border-color: #c53b42; }
 .stButton > button[kind="primary"]:hover { background: #df494f; border-color: #df494f; }
 div[data-testid="stVerticalBlock"] div[data-testid="stMarkdownContainer"] p { color: #9aacc0; }
+[data-testid="stExpander"] { background: #111b28; border: 1px solid #26364a; border-radius: 8px; }
 </style>
 """, unsafe_allow_html=True)
 st.title("A股策略选股终端")
@@ -694,7 +714,11 @@ else:
     st.download_button("导出筛选结果 CSV", result.to_csv(index=False).encode("utf-8-sig"), "baostock_screen.csv", "text/csv")
     if not result.empty:
         st.subheader("个股行情分析")
-        choice = st.selectbox("选择股票查看日K", result["代码"].tolist(), label_visibility="collapsed")
+        stocks = result[["代码", "名称"]].drop_duplicates("代码")
+        name_by_code = dict(stocks.itertuples(index=False, name=None))
+        stock_codes = list(name_by_code)
+        choice = st.selectbox("选择股票", stock_codes, format_func=lambda code: name_by_code[code])
+        interval = st.radio("K线周期", ["日线", "周线", "月线"], horizontal=True, label_visibility="collapsed")
         start_date, end_date = st.session_state["range"]
         frame = _cache_read(choice, start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d"))
         if not frame.empty:
@@ -706,4 +730,8 @@ else:
             quote_columns[1].metric("最高", f"{latest.high:.2f}")
             quote_columns[2].metric("最低", f"{latest.low:.2f}")
             quote_columns[3].metric("成交量", f"{latest.volume:,.0f}")
-            st.plotly_chart(price_figure(frame, choice), use_container_width=True, config={"displaylogo": False, "scrollZoom": True})
+            lightweight_charts_v5_component(
+                name=f"{name_by_code[choice]} {choice}",
+                charts=chart_panes(frame, f"{name_by_code[choice]} · {choice}", interval),
+                height=590, zoom_level=85, key=f"chart_{choice}_{interval}",
+            )
