@@ -44,6 +44,18 @@
   - 集成 **TradingView Lightweight Charts v5**，支持日线 / 周线 / 月线切换、MA5/10/20/30 均线、成交量及可开关的 **MACD (12, 26, 9)** 副图。
 - **20 套技术策略矩阵**：按「趋势突破 / 涨停战法 / 均线共振 / 形态反转」四大流派归类，支持一键应用流派组合或自由多选。
 
+### 界面示例
+
+<p align="center">
+  <img src="./assets/preview_workbench.jpg" alt="策略选股工作台与信号榜" width="100%" /><br />
+  <sub><b>图 1：策略选股工作台与信号榜（内置近 20 日迷你走势图、换手率进度条与红涨绿跌高亮）</b></sub>
+</p>
+
+<p align="center">
+  <img src="./assets/preview_chart.jpg" alt="个股深度行情终端与多周期 K 线" width="100%" /><br />
+  <sub><b>图 2：个股深度行情终端（支持点击信号表联动、多周期切换、MA5/10/20/30 及 MACD 副图）</b></sub>
+</p>
+
 ---
 
 ## 项目目录结构
