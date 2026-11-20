@@ -262,17 +262,11 @@ baostock-visual-screener/
 
 ---
 
-## ⭐️ 欢迎 Star 与社区共建
+## ⭐️ 欢迎 Star 与交流共建
 
 开源不易，如果这个小工具对您有所帮助或带来了启发：
 - 请在右上角点击一下 **Star ⭐️** 支持我们，让更多量化与股票投资爱好者看到这个项目！
-- 如果您有新的量化战法、技术指标或改进建议，非常欢迎提交 [Issues](https://github.com/henryorpeter/baostock-visual-screener/issues) 或 Pull Requests 共同共建！
-
-<p align="center">
-  <a href="https://star-history.com/#henryorpeter/baostock-visual-screener&Date">
-    <img src="https://api.star-history.com/svg?repos=henryorpeter/baostock-visual-screener&type=Date" alt="Star History Chart" style="max-width: 100%;" />
-  </a>
-</p>
+- 如果您有新的量化战法、技术指标、改进建议或商务交流，非常欢迎发送邮件至 **[1561784670@qq.com](mailto:1561784670@qq.com)**，或在 GitHub 提交 [Issues](https://github.com/henryorpeter/baostock-visual-screener/issues) 共同交流共建！
 
 ---
 
