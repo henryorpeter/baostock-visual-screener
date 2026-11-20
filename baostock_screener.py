@@ -3,10 +3,12 @@
 运行：streamlit run baostock_screener.py
 """
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from html import escape
+import json
 from pathlib import Path
 import sqlite3
+import threading
 import time
 import requests
 
@@ -20,17 +22,59 @@ from lightweight_charts_v5 import lightweight_charts_v5_component
 DAILY_FIELDS = "date,code,open,high,low,close,volume,amount,turn,pctChg,isST"
 BAOSTOCK_AVAILABLE = None
 CACHE_DB = Path(__file__).with_name("stock_cache.sqlite3")
+SYNC_LOCK = threading.Lock()
+AUTO_SYNC_TIMES = ["15:15", "15:30", "15:35", "16:00", "17:00", "18:00", "20:00"]
 
 
 def _init_cache():
-    with sqlite3.connect(CACHE_DB) as conn:
+    with sqlite3.connect(CACHE_DB, timeout=30) as conn:
+        conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("""CREATE TABLE IF NOT EXISTS daily (
             code TEXT NOT NULL, date TEXT NOT NULL, open REAL, high REAL, low REAL,
             close REAL, volume REAL, amount REAL, turn REAL, pctChg REAL, isST TEXT,
             PRIMARY KEY (code, date))""")
         conn.execute("CREATE TABLE IF NOT EXISTS sync_meta (code TEXT PRIMARY KEY, start_date TEXT NOT NULL, through_date TEXT NOT NULL)")
         conn.execute("CREATE TABLE IF NOT EXISTS stock_names (code TEXT PRIMARY KEY, name TEXT NOT NULL)")
+        conn.execute("CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_daily_code_date ON daily(code,date)")
+
+
+def _setting_get(key, default=None):
+    _init_cache()
+    with sqlite3.connect(CACHE_DB, timeout=30) as conn:
+        row = conn.execute("SELECT value FROM app_settings WHERE key=?", (key,)).fetchone()
+    return row[0] if row else default
+
+
+def _setting_set(key, value):
+    _init_cache()
+    with sqlite3.connect(CACHE_DB, timeout=30) as conn:
+        conn.execute("INSERT OR REPLACE INTO app_settings(key, value) VALUES (?, ?)", (key, str(value)))
+
+
+def get_auto_sync_config():
+    enabled = _setting_get("auto_sync_enabled", "1") == "1"
+    sync_time = _setting_get("auto_sync_time", "15:35")
+    if sync_time not in AUTO_SYNC_TIMES:
+        sync_time = "15:35"
+    last_date = _setting_get("auto_sync_last_date", "")
+    raw_info = _setting_get("auto_sync_last_info", "")
+    try:
+        last_info = json.loads(raw_info) if raw_info else {}
+    except Exception:
+        last_info = {}
+    return {
+        "enabled": enabled,
+        "sync_time": sync_time,
+        "last_date": last_date,
+        "last_info": last_info,
+    }
+
+
+def save_auto_sync_config(enabled, sync_time):
+    _setting_set("auto_sync_enabled", "1" if enabled else "0")
+    if sync_time in AUTO_SYNC_TIMES:
+        _setting_set("auto_sync_time", sync_time)
 
 
 def _cache_read(code, start, end):
@@ -244,8 +288,7 @@ def _tencent_stock_list():
     return pd.DataFrame([{"code": code, "tradeStatus": "1", "code_name": name} for code, name in rows.items()])
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def stock_list(day):
+def _fetch_stock_list(day):
     global BAOSTOCK_AVAILABLE
     def run():
         requested = pd.Timestamp(day)
@@ -282,6 +325,11 @@ def stock_list(day):
         return frame, actual_day, source
     frame = frame[frame.code.str.match(r"^(sh\.(600|601|603|605|688|689)|sz\.(000|001|002|003|300|301))\d{3}$")].copy()
     return frame, actual_day, source
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def stock_list(day):
+    return _fetch_stock_list(day)
 
 
 def _history(code, start, end):
@@ -437,6 +485,145 @@ def update_cache(codes, start, end, progress):
     source = "腾讯 HTTPS 并发" if BAOSTOCK_AVAILABLE is False else ("Baostock + HTTPS 回退" if pending else "Baostock")
     return {"updated": len(changed), "skipped": skipped, "failed": len(failures),
             "failures": list(failures.items())[:10], "source": source}
+
+
+class AutoSyncManager:
+    """进程级单例：每个交易日收盘后自动增量更新一次全市场行情缓存。"""
+
+    def __init__(self):
+        self._state_lock = threading.Lock()
+        self._running = False
+        self._ratio = 0.0
+        self._text = ""
+        self._started_at = 0.0
+        self._error = ""
+        self._retry_after = 0.0
+        self._thread = None
+
+    def start(self):
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._thread = threading.Thread(target=self._loop, name="klineradar-auto-sync", daemon=True)
+        self._thread.start()
+
+    def _set_state(self, **kwargs):
+        with self._state_lock:
+            for k, v in kwargs.items():
+                setattr(self, f"_{k}", v)
+
+    def should_run_today(self, now=None):
+        now = now or datetime.now()
+        cfg = get_auto_sync_config()
+        if not cfg["enabled"]:
+            return False, "已关闭"
+        if now.weekday() >= 5:
+            return False, "周末休市"
+        today_str = now.strftime("%Y-%m-%d")
+        if cfg["last_date"] == today_str:
+            return False, "今日已自动更新"
+        local = cache_status()
+        if local["newest"] and local["newest"] >= today_str:
+            return False, "今日行情已是最新"
+        if now.strftime("%H:%M") < cfg["sync_time"]:
+            return False, f"等待收盘后 {cfg['sync_time']} 触发"
+        return True, "待自动更新"
+
+    def _loop(self):
+        # 启动后稍作延迟，让页面完成首次渲染
+        time.sleep(2.5)
+        while True:
+            try:
+                now = datetime.now()
+                should_run, _ = self.should_run_today(now)
+                if should_run and time.monotonic() >= self._retry_after:
+                    self._execute_sync(trigger_label="收盘后自动更新")
+            except Exception as exc:
+                self._set_state(error=str(exc))
+            time.sleep(30)
+
+    def trigger_now(self):
+        if self._running or SYNC_LOCK.locked():
+            return False
+        t = threading.Thread(
+            target=self._execute_sync,
+            kwargs={"trigger_label": "后台手动触发"},
+            name="klineradar-manual-bg-sync",
+            daemon=True,
+        )
+        t.start()
+        return True
+
+    def _execute_sync(self, trigger_label="收盘后自动更新"):
+        if not SYNC_LOCK.acquire(blocking=False):
+            return
+        today_dt = date.today()
+        today_str = today_dt.strftime("%Y-%m-%d")
+        start_str = (today_dt - timedelta(days=210)).strftime("%Y-%m-%d")
+        self._set_state(running=True, ratio=0.02, text=f"{trigger_label}：正在获取最新 A 股股票列表…", started_at=time.monotonic(), error="")
+
+        class _BgProgress:
+            def progress(_, ratio, text=""):
+                self._set_state(ratio=0.12 + 0.86 * min(1.0, max(0.0, ratio)), text=f"{trigger_label}：{text}")
+
+        try:
+            stocks, list_date, list_source = _fetch_stock_list(today_str)
+            if stocks.empty:
+                raise RuntimeError("未获取到可用股票列表")
+            cache_universe_save(stocks)
+            all_codes = list(stocks[["code", "code_name"]].itertuples(index=False, name=None))
+            self._set_state(ratio=0.12, text=f"{trigger_label}：已获取 {len(all_codes):,} 只标的（{list_source}），正在增量补齐今日行情…")
+            stats = update_cache(all_codes, start_str, today_str, _BgProgress())
+            finished_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            info = {
+                "time": finished_at,
+                "date": today_str,
+                "trigger": trigger_label,
+                "updated": stats.get("updated", 0),
+                "skipped": stats.get("skipped", 0),
+                "failed": stats.get("failed", 0),
+                "source": stats.get("source", "Baostock"),
+                "status": "warning" if stats.get("failed") else "success",
+            }
+            _setting_set("auto_sync_last_date", today_str)
+            _setting_set("auto_sync_last_info", json.dumps(info, ensure_ascii=False))
+            self._set_state(ratio=1.0, text=f"{trigger_label}完成：更新 {info['updated']} 只，跳过 {info['skipped']} 只")
+        except Exception as exc:
+            self._set_state(error=str(exc), retry_after=time.monotonic() + 1800)
+            info = {
+                "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "date": today_str,
+                "trigger": trigger_label,
+                "error": str(exc),
+                "status": "error",
+            }
+            _setting_set("auto_sync_last_info", json.dumps(info, ensure_ascii=False))
+        finally:
+            self._set_state(running=False)
+            SYNC_LOCK.release()
+
+    def snapshot(self):
+        cfg = get_auto_sync_config()
+        _, today_status = self.should_run_today()
+        with self._state_lock:
+            return {
+                "enabled": cfg["enabled"],
+                "sync_time": cfg["sync_time"],
+                "last_date": cfg["last_date"],
+                "last_info": cfg["last_info"],
+                "running": self._running,
+                "ratio": self._ratio,
+                "text": self._text,
+                "elapsed": (time.monotonic() - self._started_at) if self._running and self._started_at else 0.0,
+                "error": self._error,
+                "today_status": "后台同步中…" if self._running else today_status,
+            }
+
+
+@st.cache_resource
+def get_auto_sync_manager():
+    mgr = AutoSyncManager()
+    mgr.start()
+    return mgr
 
 
 def load_cache(codes, start, end, on_progress=None):
@@ -1426,12 +1613,21 @@ html, body, [class*="css"] {
 """, unsafe_allow_html=True)
 
 
-def _render_hero(local_status, selected_strategies):
+def _render_hero(local_status, selected_strategies, auto_sync=None):
     newest = local_status["newest"] or "待同步"
     stocks_cnt = local_status["stocks"]
     is_ready = stocks_cnt > 0
     pill_cls = "status-pill live" if is_ready else "status-pill"
     status_text = "离线引擎就绪" if is_ready else "尚未建立缓存"
+
+    sync_pill = ""
+    if auto_sync:
+        if auto_sync["running"]:
+            pct = int(round(auto_sync["ratio"] * 100))
+            sync_pill = f'<span class="status-pill" style="border-color:rgba(56,189,248,0.45);background:rgba(56,189,248,0.12);color:#7dd3fc;">⟳ 自动更新 {pct}%</span>'
+        elif auto_sync["enabled"]:
+            sync_pill = f'<span class="status-pill">收盘自动更新 {escape(auto_sync["sync_time"])}</span>'
+
     st.markdown(f"""
 <div class="hero-bar">
     <div class="hero-left">
@@ -1455,6 +1651,7 @@ def _render_hero(local_status, selected_strategies):
         <span class="status-pill mono">{stocks_cnt:,} 标的</span>
         <span class="status-pill mono">最新 {escape(str(newest))}</span>
         <span class="status-pill">已选 {len(selected_strategies)} 策略</span>
+        {sync_pill}
     </div>
 </div>
 """, unsafe_allow_html=True)
@@ -1582,6 +1779,9 @@ class FloatingProgress:
 
 
 def _run_update_action(start, end):
+    if not SYNC_LOCK.acquire(blocking=False):
+        st.info("后台正在执行自动行情更新，请稍候完成后再试。")
+        return
     tracker = FloatingProgress("正在更新全市场行情缓存", ("获取股票列表", "同步历史日线", "写入本地库"))
     try:
         tracker.update(0.05, stage=1, detail="正在连接数据源获取最新 A 股股票列表…")
@@ -1603,6 +1803,21 @@ def _run_update_action(start, end):
         time.sleep(0.2)
     finally:
         tracker.close()
+        SYNC_LOCK.release()
+
+    if end >= date.today():
+        today_str = date.today().strftime("%Y-%m-%d")
+        _setting_set("auto_sync_last_date", today_str)
+        _setting_set("auto_sync_last_info", json.dumps({
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "date": today_str,
+            "trigger": "手动全市场更新",
+            "updated": update_stats.get("updated", 0),
+            "skipped": update_stats.get("skipped", 0),
+            "failed": update_stats.get("failed", 0),
+            "source": update_stats.get("source", "Baostock"),
+            "status": "warning" if update_stats.get("failed") else "success",
+        }, ensure_ascii=False))
 
     if list_date != end.strftime("%Y-%m-%d"):
         st.info(f"{end:%Y-%m-%d} 的股票列表尚未发布，已使用最近可用列表日期：{list_date}。行情仍按所选结束日期查询。")
@@ -1757,12 +1972,35 @@ with st.sidebar:
     sac.divider(label="执行操作", icon="lightning-charge", align="start", size="xs", color="gray")
     run_btn = st.button("开始本地选股", type="primary", use_container_width=True, icon=":material/radar:")
     update_btn = st.button("更新全市场行情缓存", use_container_width=True, icon=":material/cloud_sync:")
-    st.caption("提示：日常选股全程离线读取 SQLite，仅在需要补齐最新交易日行情时点击更新。")
+
+    sync_mgr = get_auto_sync_manager()
+    auto_cfg = get_auto_sync_config()
+    auto_toggle = st.toggle(
+        f"收盘后自动更新 ({auto_cfg['sync_time']})",
+        value=auto_cfg["enabled"],
+        help="每个交易日（周一至周五）收盘后自动在后台增量更新一次全市场日线，可在「数据源与缓存中心」自定义时间。",
+        key="sb_auto_sync_toggle",
+    )
+    if auto_toggle != auto_cfg["enabled"]:
+        save_auto_sync_config(auto_toggle, auto_cfg["sync_time"])
+        st.rerun()
+
+    auto_state = sync_mgr.snapshot()
+    st.caption(f"自动更新状态：{auto_state['today_status']} · 日常选股全程离线读取 SQLite。")
 
 
 # ========================== Main Header & Navigation ==========================
 local_status = cache_status()
-_render_hero(local_status, strategies)
+auto_state = sync_mgr.snapshot()
+_render_hero(local_status, strategies, auto_sync=auto_state)
+
+if auto_state["running"]:
+    b1, b2 = st.columns([5, 1], vertical_alignment="center")
+    with b1:
+        st.progress(min(1.0, max(0.02, auto_state["ratio"])), text=f"{auto_state['text']}（已耗时 {auto_state['elapsed']:.0f}s，不阻塞本地选股）")
+    with b2:
+        if st.button("刷新进度", use_container_width=True, key="refresh_bg_sync_btn"):
+            st.rerun()
 
 valid_params = True
 if start >= end:
@@ -2160,6 +2398,50 @@ elif active_tab == "策略百科矩阵":
 # ========================== Tab 3: 数据源与缓存中心 ==========================
 elif active_tab == "数据源与缓存中心":
     _render_kpi_cards(local_status, result, st.session_state.get("scan_count"))
+
+    st.markdown("""
+    <div class="sec-head">
+        <div class="sec-title"><span class="sec-dot"></span>收盘后自动更新配置</div>
+        <div class="sec-meta">每个交易日（周一至周五）收盘后后台自动增量更新一次，当天仅执行一次，绝不重复拉取</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    ac1, ac2, ac3, ac4 = st.columns([1.2, 1.3, 1.8, 1.3], vertical_alignment="bottom")
+    with ac1:
+        tab_enabled = st.toggle("启用收盘后自动更新", value=auto_state["enabled"], key="tab_auto_sync_toggle")
+    with ac2:
+        time_idx = AUTO_SYNC_TIMES.index(auto_state["sync_time"]) if auto_state["sync_time"] in AUTO_SYNC_TIMES else 2
+        tab_time = st.selectbox("每日收盘后触发时间", options=AUTO_SYNC_TIMES, index=time_idx, key="tab_auto_sync_time")
+    if tab_enabled != auto_state["enabled"] or tab_time != auto_state["sync_time"]:
+        save_auto_sync_config(tab_enabled, tab_time)
+        st.toast(f"已保存自动更新设置：{'开启' if tab_enabled else '关闭'}（每日 {tab_time}）", icon="✅")
+        st.rerun()
+    with ac3:
+        st.info(f"今日状态：**{auto_state['today_status']}**（上次自动更新日：{auto_state['last_date'] or '暂无'}）")
+    with ac4:
+        if st.button("立即后台更新一次", use_container_width=True, disabled=auto_state["running"], icon=":material/sync:"):
+            if sync_mgr.trigger_now():
+                st.toast("已启动后台增量更新任务，可在顶部查看实时进度", icon="🚀")
+                st.rerun()
+            else:
+                st.warning("当前已有同步任务正在运行中。")
+
+    last_auto = auto_state.get("last_info") or {}
+    if last_auto:
+        if last_auto.get("status") == "error":
+            sac.alert(
+                label=f"最近一次自动更新失败（{last_auto.get('time', '')}）",
+                description=f"原因：{last_auto.get('error', '未知错误')}（后台将在 30 分钟后自动重试，也可手动重试）",
+                color="error",
+                icon=True,
+            )
+        else:
+            sac.alert(
+                label=f"最近一次同步记录：{last_auto.get('trigger', '自动更新')} · {last_auto.get('time', '')}（通道：{last_auto.get('source', 'Baostock')}）",
+                description=f"新增/更新 {last_auto.get('updated', 0)} 只 · 跳过已缓存 {last_auto.get('skipped', 0)} 只 · 失败 {last_auto.get('failed', 0)} 只",
+                color="warning" if last_auto.get("failed") else "success",
+                icon=True,
+            )
 
     st.markdown("""
     <div class="sec-head">
