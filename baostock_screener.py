@@ -522,11 +522,12 @@ def strategy_signal(frame, name, d=None):
     return bool(rules.get(name, False)), STRATEGIES[name]
 
 
-def screen(codes, frames, strategies, min_change, min_turn, max_turn, on_progress=None):
+def screen(codes, frames, strategies, min_change, min_turn, max_turn, on_progress=None, window_start=None):
     rows = []
     sparks = {}
     stats = {"ready": 0, "missing": 0, "short": 0}
     fallback_progress = None if on_progress else st.progress(0, text="正在读取本地行情…")
+    window_start_ts = pd.Timestamp(window_start) if window_start is not None else None
 
     def _emit(ratio, stage, detail, hits=0, scanned=0, total=0):
         if on_progress:
@@ -545,6 +546,9 @@ def screen(codes, frames, strategies, min_change, min_turn, max_turn, on_progres
         for i, (code, name) in enumerate(codes, 1):
             frame = frames.get(code)
             if frame is None or frame.empty:
+                stats["missing"] += 1
+            elif window_start_ts is not None and frame["date"].max() < window_start_ts:
+                # 所选日期区间内无任何交易记录（如长期停牌），不拿陈旧历史冒充当期信号
                 stats["missing"] += 1
             elif len(frame) < 70:
                 stats["short"] += 1
@@ -653,8 +657,12 @@ def _resample_kline(frame, interval):
     return d
 
 
-def chart_panes(frame, title, interval, show_ma=True, show_macd=False):
+def chart_panes(frame, title, interval, show_ma=True, show_macd=False, display_start=None):
     d = _resample_kline(frame, interval)
+    if display_start is not None and not d.empty:
+        sliced = d[d["date"] >= pd.Timestamp(display_start)].reset_index(drop=True)
+        if not sliced.empty:
+            d = sliced
     up, down = "#ef5350", "#26a69a"
     theme = {
         "layout": {
@@ -1626,14 +1634,16 @@ def _run_screen_action(start, end, strategies, min_change, min_turn, max_turn, m
         limit = min(int(max_stocks), len(universe))
         stride = max(1, len(universe) // limit)
         selected = universe[::stride][:limit]
-        start_text, end_text = start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")
-        frames = load_cache(selected, start_text, end_text, on_progress=tracker.update)
+        # 为保证 MA60/MACD/RSI/RPS 等指标充分预热且数据精准，后台自动向前多读取前置历史行情
+        lookback_start = min(start, end - timedelta(days=210))
+        frames = load_cache(selected, lookback_start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"), on_progress=tracker.update)
         if not frames:
             tracker.close()
             st.error("本地没有所选日期范围的行情数据，请先点击「更新全市场行情缓存」。")
             return
         result, scan_stats = screen(
-            selected, frames, strategies, min_change, min_turn, max_turn, on_progress=tracker.update
+            selected, frames, strategies, min_change, min_turn, max_turn,
+            on_progress=tracker.update, window_start=start,
         )
         sparks = scan_stats.pop("sparks", {})
         tracker.update(
@@ -1984,7 +1994,8 @@ if active_tab == "策略选股工作台":
 
             choice = st.session_state["active_stock"]
             start_date, end_date = st.session_state["range"]
-            frame = _cache_read(choice, start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d"))
+            chart_fetch_start = start_date - timedelta(days=150)
+            frame = _cache_read(choice, chart_fetch_start.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d"))
 
             if not frame.empty:
                 latest = frame.iloc[-1]
@@ -2043,7 +2054,10 @@ if active_tab == "策略选股工作台":
                 with opt3:
                     st.caption(f"当前展示第 {current_idx + 1} / {len(stock_codes)} 只 · 区间 {start_date:%Y-%m-%d} ~ {end_date:%Y-%m-%d}")
 
-                panes, kdf = chart_panes(frame, f"{name_by_code[choice]} · {choice}", interval, show_ma=show_ma, show_macd=show_macd)
+                panes, kdf = chart_panes(
+                    frame, f"{name_by_code[choice]} · {choice}", interval,
+                    show_ma=show_ma, show_macd=show_macd, display_start=start_date,
+                )
                 last_k = kdf.iloc[-1]
                 legend_parts = []
                 if show_ma:
