@@ -1438,7 +1438,7 @@ def _render_hero(local_status, selected_strategies):
             </svg>
         </div>
         <div>
-            <h1 class="hero-title">A股量化策略选股终端</h1>
+            <h1 class="hero-title">KLineRadar · A股技术形态选股终端</h1>
             <p class="hero-subtitle">Baostock 本地行情引擎 · 20 套技术形态策略 · TradingView 专业多周期图表</p>
         </div>
     </div>
@@ -1678,7 +1678,7 @@ def _style_pct(val):
 
 # ========================== Page Setup ==========================
 st.set_page_config(
-    page_title="A股量化策略选股终端 · Baostock",
+    page_title="KLineRadar · A股技术形态选股终端",
     page_icon="📈",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -1739,7 +1739,7 @@ with st.sidebar:
         placeholder="请选择至少一个选股策略…",
     )
 
-    sac.divider(label="量化过滤", icon="funnel", align="start", size="xs", color="gray")
+    sac.divider(label="行情过滤", icon="funnel", align="start", size="xs", color="gray")
     min_change = st.number_input("最低涨跌幅 (%)", -10.0, 20.0, 0.0, 0.5, format="%.1f")
     min_turn, max_turn = st.slider("换手率范围 (%)", 0.0, 100.0, (0.0, 100.0), step=0.5)
     max_stocks = st.number_input("最多扫描股票数 (只)", 10, 6000, 6000, 200)
@@ -1818,7 +1818,7 @@ if active_tab == "策略选股工作台":
                     <path d="M12 12L17.5 6.5" stroke="#38bdf8" stroke-width="1.8" stroke-linecap="round"/>
                 </svg>
             </div>
-            <div class="empty-title">本地量化选股引擎已就绪</div>
+            <div class="empty-title">KLineRadar 本地选股引擎已就绪</div>
             <div class="empty-desc">
                 已从本地 SQLite 就绪 <strong style="color:#f8fafc;">{local_status['stocks']:,}</strong> 只 A 股日线行情（最新至 <span class="mono" style="color:#38bdf8;">{escape(str(local_status['newest'] or '暂无'))}</span>）。
                 点击下方或左侧「开始本地选股」，将实时弹出扫描进度面板并呈现信号榜与专业 K 线图表。
@@ -2086,7 +2086,7 @@ if active_tab == "策略选股工作台":
 elif active_tab == "策略百科矩阵":
     st.markdown("""
     <div class="sec-head">
-        <div class="sec-title"><span class="sec-dot"></span>20 套 A 股量化选股策略矩阵</div>
+        <div class="sec-title"><span class="sec-dot"></span>20 套 A 股技术形态策略矩阵</div>
         <div class="sec-meta">所有策略均基于本地日线 OHLCV 与量价/均线/MACD/KDJ/RSI 因子实时计算</div>
     </div>
     """, unsafe_allow_html=True)
