@@ -7,12 +7,15 @@ from datetime import date, datetime, timedelta
 from html import escape
 import json
 from pathlib import Path
+import re
 import sqlite3
 import threading
 import time
 import requests
+from requests.adapters import HTTPAdapter
 
 import baostock as bs
+import numpy as np
 import pandas as pd
 import streamlit as st
 import streamlit_antd_components as sac
@@ -23,7 +26,20 @@ DAILY_FIELDS = "date,code,open,high,low,close,volume,amount,turn,pctChg,isST"
 BAOSTOCK_AVAILABLE = None
 CACHE_DB = Path(__file__).with_name("stock_cache.sqlite3")
 SYNC_LOCK = threading.Lock()
+_THREAD_LOCAL = threading.local()
 AUTO_SYNC_TIMES = ["15:15", "15:30", "15:35", "16:00", "17:00", "18:00", "20:00"]
+
+
+def _http_session():
+    session = getattr(_THREAD_LOCAL, "http_session", None)
+    if session is None:
+        session = requests.Session()
+        adapter = HTTPAdapter(pool_connections=16, pool_maxsize=16)
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+        session.headers.update({"User-Agent": "Mozilla/5.0"})
+        _THREAD_LOCAL.http_session = session
+    return session
 
 
 def _init_cache():
@@ -199,31 +215,29 @@ def _query(fn):
 
 def _https_json(url, params, referer):
     error = None
+    session = _http_session()
     for attempt in range(3):
         try:
-            response = requests.get(
-                url, params=params,
-                headers={"User-Agent": "Mozilla/5.0", "Referer": referer}, timeout=15,
-            )
+            response = session.get(url, params=params, headers={"Referer": referer}, timeout=12)
             response.raise_for_status()
             return response.json()
         except (requests.RequestException, ValueError) as exc:
             error = exc
             if attempt < 2:
-                time.sleep(attempt + 1)
+                time.sleep(0.6 * (attempt + 1))
     raise RuntimeError(f"HTTPS 行情备用源请求失败：{error}")
 
 
 def _tonghuashun_stock_list():
-    """同花顺公开 A 股分页页，作为 Baostock/东方财富不可用时的列表源。"""
-    import re
+    """同花顺公开 A 股分页页，作为 Baostock/腾讯不可用时的列表源。"""
     from html import unescape
     rows = {}
-    headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://q.10jqka.com.cn/"}
+    session = _http_session()
+    headers = {"Referer": "https://q.10jqka.com.cn/"}
     page_count = 280
     for page in range(1, page_count + 1):
         url = f"https://q.10jqka.com.cn/index/index/board/all/field/zdf/order/desc/page/{page}/"
-        response = requests.get(url, headers=headers, timeout=15)
+        response = session.get(url, headers=headers, timeout=15)
         response.raise_for_status()
         response.encoding = "gbk"
         page_info = re.search(r'class="page_info">\s*\d+/(\d+)', response.text)
@@ -253,23 +267,21 @@ def _tonghuashun_stock_list():
 
 
 def _tencent_stock_list():
-    """同花顺受限时，用腾讯实时报价核验候选代码并构建真实股票列表。"""
-    import re
+    """用腾讯批量实时报价并发核验候选代码并极速构建全市场股票列表。"""
     ranges = [(600000, 600999), (601000, 601999), (603000, 603999),
               (605000, 605999), (688000, 689999), (0, 3999),
               (300000, 301999)]
     codes = []
     for first, last in ranges:
         codes.extend(f"{n:06d}" for n in range(first, last + 1))
-    rows = {}
-    headers = {"User-Agent": "Mozilla/5.0"}
-    session = requests.Session()
-    for offset in range(0, len(codes), 300):
-        batch = codes[offset:offset + 300]
+    batches = [codes[offset:offset + 300] for offset in range(0, len(codes), 300)]
+
+    def _fetch_batch(batch):
         symbols = [f"{'sh' if code[0] in '68' else 'sz'}{code}" for code in batch]
-        response = session.get("https://qt.gtimg.cn/q=" + ",".join(symbols), headers=headers, timeout=15)
+        response = _http_session().get("https://qt.gtimg.cn/q=" + ",".join(symbols), timeout=15)
         response.raise_for_status()
         response.encoding = "gbk"
+        parsed = []
         for symbol, content in re.findall(r'v_((?:sh|sz)\d{6})="([^"]*)"', response.text):
             fields = content.split("~")
             if len(fields) < 4 or not fields[1] or fields[1] == "N/A":
@@ -280,8 +292,15 @@ def _tencent_stock_list():
             except ValueError:
                 continue
             code = symbol[:2] + "." + symbol[2:]
-            name = fields[1]
+            name = fields[1].strip()
             if "退" not in name and not any(word in name for word in ("债", "基金", "ETF", "LOF", "指数")):
+                parsed.append((code, name))
+        return parsed
+
+    rows = {}
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        for batch_rows in pool.map(_fetch_batch, batches):
+            for code, name in batch_rows:
                 rows[code] = name
     if len(rows) < 1000:
         raise RuntimeError(f"腾讯 HTTPS 仅核验到 {len(rows)} 只股票，列表不完整")
@@ -290,37 +309,40 @@ def _tencent_stock_list():
 
 def _fetch_stock_list(day):
     global BAOSTOCK_AVAILABLE
-    def run():
-        requested = pd.Timestamp(day)
-        for offset in range(11):
-            actual_day = (requested - pd.Timedelta(days=offset)).strftime("%Y-%m-%d")
-            frame = _rows(bs.query_all_stock(day=actual_day))
-            if not frame.empty:
-                return frame, actual_day
-        return pd.DataFrame(), ""
+    frame, actual_day, source = pd.DataFrame(), day, ""
+    errors = []
 
-    if BAOSTOCK_AVAILABLE is False:
-        frame, actual_day = pd.DataFrame(), ""
-    else:
+    try:
+        frame = _tencent_stock_list()
+        source = "腾讯批量接口"
+    except Exception as qq_error:
+        errors.append(f"腾讯列表失败：{qq_error}")
+
+    if frame.empty and BAOSTOCK_AVAILABLE is not False:
+        def run():
+            requested = pd.Timestamp(day)
+            for offset in range(11):
+                q_day = (requested - pd.Timedelta(days=offset)).strftime("%Y-%m-%d")
+                res = _rows(bs.query_all_stock(day=q_day))
+                if not res.empty:
+                    return res, q_day
+            return pd.DataFrame(), ""
         try:
             frame, actual_day = _query(run)
-        except Exception:
+            source = "Baostock"
+        except Exception as bs_error:
             BAOSTOCK_AVAILABLE = False
-            frame, actual_day = pd.DataFrame(), ""
-    source = "Baostock"
+            errors.append(f"Baostock 失败：{bs_error}")
+
     if frame.empty:
         try:
             frame = _tonghuashun_stock_list()
             source = "同花顺 HTTPS"
+            actual_day = day
         except Exception as ths_error:
-            try:
-                frame = _tencent_stock_list()
-                source = "腾讯 HTTPS 备用源"
-            except Exception as qq_error:
-                raise RuntimeError(
-                    f"Baostock 登录失败；同花顺备用列表不可用：{ths_error}；腾讯备用列表不可用：{qq_error}"
-                ) from qq_error
-        actual_day = day
+            errors.append(f"同花顺备用列表失败：{ths_error}")
+            raise RuntimeError("；".join(errors)) from ths_error
+
     if frame.empty:
         return frame, actual_day, source
     frame = frame[frame.code.str.match(r"^(sh\.(600|601|603|605|688|689)|sz\.(000|001|002|003|300|301))\d{3}$")].copy()
@@ -346,11 +368,12 @@ def _history(code, start, end):
     return frame.dropna(subset=["close"]).sort_values("date")
 
 
-def _history_http(code, start, end):
+def _history_http(code, start, end, name=""):
     market, symbol = code.split(".")
+    days = min(1000, max(60, (pd.Timestamp(end) - pd.Timestamp(start)).days + 30))
     payload = _https_json(
         "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get",
-        {"param": f"{market}{symbol},day,,,{min(1000, max(500, (pd.Timestamp(end) - pd.Timestamp(start)).days + 30))},qfq"},
+        {"param": f"{market}{symbol},day,,,{days},qfq"},
         "https://gu.qq.com/",
     )
     payload = (payload.get("data") or {}).get(f"{market}{symbol}", {})
@@ -359,18 +382,83 @@ def _history_http(code, start, end):
     if frame.empty:
         raise RuntimeError(f"腾讯 HTTPS 备用源未返回 {code} 的日线数据")
     frame["code"] = code
-    frame["amount"] = 0
     frame["turn"] = float("nan")
     frame["pctChg"] = pd.to_numeric(frame["close"], errors="coerce").pct_change().mul(100)
-    frame["isST"] = "0"
-    frame = frame[(frame.date >= start) & (frame.date <= end)]
-    for col in ("open", "high", "low", "close", "volume", "amount"):
+    frame["isST"] = "1" if "ST" in (name or "").upper() else "0"
+    frame = frame[(frame.date >= start) & (frame.date <= end)].copy()
+    for col in ("open", "high", "low", "close", "volume"):
         frame[col] = pd.to_numeric(frame[col], errors="coerce")
-    if symbol.startswith(("688", "689")):
-        frame["volume"] = frame["volume"] / 100
-    frame["amount"] = frame["close"] * frame["volume"] * 100
+    # 腾讯 fqkline：科创板(688/689)成交量单位已是股，其余板块单位为手(需×100转为股)
+    if not symbol.startswith(("688", "689")):
+        frame["volume"] = frame["volume"] * 100.0
+    frame["amount"] = frame["close"] * frame["volume"]
     frame["date"] = pd.to_datetime(frame["date"])
     return frame.dropna(subset=["close"]).sort_values("date")
+
+
+def _history_eastmoney(code, start, end, name=""):
+    """东方财富前复权日线接口：返回含换手率、成交额的完整日线（所有板块成交量均以手为单位）。"""
+    market, symbol = code.split(".")
+    secid = f"{'1' if market == 'sh' else '0'}.{symbol}"
+    payload = _https_json(
+        "https://push2his.eastmoney.com/api/qt/stock/kline/get",
+        {
+            "secid": secid,
+            "fields1": "f1,f2,f3,f4,f5,f6",
+            "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
+            "klt": "101",
+            "fqt": "1",
+            "beg": start.replace("-", ""),
+            "end": end.replace("-", ""),
+        },
+        "https://quote.eastmoney.com/",
+    )
+    data = payload.get("data")
+    if data is None:
+        raise RuntimeError(f"东方财富未返回 {code} 数据")
+    klines = data.get("klines") or []
+    is_st = "1" if "ST" in (name or "").upper() else "0"
+    parsed = []
+    for line in klines:
+        parts = line.split(",")
+        if len(parts) < 11:
+            continue
+        d_str = parts[0]
+        if d_str < start or d_str > end:
+            continue
+        try:
+            open_p = float(parts[1])
+            close_p = float(parts[2])
+            high_p = float(parts[3])
+            low_p = float(parts[4])
+            vol_lots = float(parts[5])
+            amt_yuan = float(parts[6])
+            pct_chg = float(parts[8])
+        except ValueError:
+            continue
+        try:
+            turn = float(parts[10])
+        except ValueError:
+            turn = float("nan")
+        parsed.append({
+            "date": d_str,
+            "code": code,
+            "open": open_p,
+            "high": high_p,
+            "low": low_p,
+            "close": close_p,
+            "volume": vol_lots * 100.0,
+            "amount": amt_yuan,
+            "turn": turn,
+            "pctChg": pct_chg,
+            "isST": is_st,
+        })
+    cols = ["date", "code", "open", "high", "low", "close", "volume", "amount", "turn", "pctChg", "isST"]
+    frame = pd.DataFrame(parsed, columns=cols)
+    if not frame.empty:
+        frame["date"] = pd.to_datetime(frame["date"])
+        frame = frame.dropna(subset=["close"]).sort_values("date")
+    return frame
 
 
 def cache_status():
@@ -393,10 +481,11 @@ def cache_status():
 
 def cache_universe_save(stocks):
     _init_cache()
-    with sqlite3.connect(CACHE_DB) as conn:
+    with sqlite3.connect(CACHE_DB, timeout=30) as conn:
         conn.execute("DELETE FROM stock_names")
         conn.executemany("INSERT OR REPLACE INTO stock_names(code,name) VALUES (?,?)",
                          stocks[["code", "code_name"]].itertuples(index=False, name=None))
+    _setting_set("stock_list_updated_date", date.today().strftime("%Y-%m-%d"))
 
 
 def cache_universe_load():
@@ -405,40 +494,320 @@ def cache_universe_load():
         return conn.execute("SELECT code,name FROM stock_names ORDER BY code").fetchall()
 
 
+def _get_universe_for_sync(day_str, force=False):
+    cached = cache_universe_load()
+    updated_date = _setting_get("stock_list_updated_date", "")
+    if not force and len(cached) >= 4000 and updated_date:
+        try:
+            age_days = (date.today() - pd.Timestamp(updated_date).date()).days
+            if 0 <= age_days <= 7:
+                return cached, updated_date, "本地股票池缓存"
+        except Exception:
+            pass
+    stocks, list_date, list_source = _fetch_stock_list(day_str)
+    if stocks.empty:
+        return [], list_date, list_source
+    cache_universe_save(stocks)
+    all_codes = list(stocks[["code", "code_name"]].itertuples(index=False, name=None))
+    return all_codes, list_date, list_source
+
+
+def _recent_trade_days(end_str, now=None):
+    """查询截止 end_str 的最近已收盘交易日及前一交易日（未满15:00排除当日盘中未收盘Bar）。"""
+    global BAOSTOCK_AVAILABLE
+    days = []
+    try:
+        resp = _http_session().get(
+            "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get",
+            params={"param": "sh000001,day,,,20,qfq"},
+            headers={"Referer": "https://gu.qq.com/"},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        node = (resp.json().get("data") or {}).get("sh000001") or {}
+        rows = node.get("qfqday") or node.get("day") or []
+        days = sorted({row[0] for row in rows if len(row) >= 1 and row[0] <= end_str})
+    except Exception:
+        days = []
+
+    if not days and BAOSTOCK_AVAILABLE is not False:
+        try:
+            start_probe = (pd.Timestamp(end_str) - pd.Timedelta(days=45)).strftime("%Y-%m-%d")
+            def run_idx():
+                return _rows(bs.query_history_k_data_plus("sh.000001", "date", start_date=start_probe, end_date=end_str, frequency="d"))
+            idx_frame = _query(run_idx)
+            if not idx_frame.empty:
+                days = sorted({str(d) for d in idx_frame["date"].tolist() if str(d) <= end_str})
+        except Exception:
+            pass
+
+    now = now or datetime.now()
+    today_str = now.strftime("%Y-%m-%d")
+    if days and days[-1] == today_str and now.strftime("%H:%M") < "15:00":
+        days.pop()
+    if not days:
+        return end_str, None
+    return days[-1], (days[-2] if len(days) >= 2 else None)
+
+
+def _probe_snapshot_date():
+    """探测腾讯批量行情接口当前截面所属日期（YYYY-MM-DD）。"""
+    try:
+        resp = _http_session().get("https://qt.gtimg.cn/q=sh000001", timeout=8)
+        resp.raise_for_status()
+        resp.encoding = "gbk"
+        match = re.search(r'v_sh000001="([^"]*)"', resp.text)
+        if not match:
+            return ""
+        parts = match.group(1).split("~")
+        if len(parts) > 30:
+            ts = parts[30].strip()
+            if len(ts) >= 8 and ts[:8].isdigit():
+                return f"{ts[:4]}-{ts[4:6]}-{ts[6:8]}"
+    except Exception:
+        pass
+    return ""
+
+
+def _fetch_tencent_snapshots(codes, progress=None, progress_range=(0.05, 0.55)):
+    """8 路并发批量拉取全市场最新交易日截面行情（每次 300 只）。"""
+    code_list = [item[0] if isinstance(item, (tuple, list)) else item for item in codes]
+    batches = [code_list[offset:offset + 300] for offset in range(0, len(code_list), 300)]
+
+    def _fetch_batch(batch):
+        symbols = [f"{code[:2]}{code[3:]}" for code in batch]
+        url = "https://qt.gtimg.cn/q=" + ",".join(symbols)
+        resp = None
+        for attempt in range(2):
+            try:
+                resp = _http_session().get(url, timeout=15)
+                resp.raise_for_status()
+                break
+            except Exception:
+                if attempt == 1:
+                    raise
+                time.sleep(0.4)
+        resp.encoding = "gbk"
+        parsed = {}
+        for symbol, content in re.findall(r'v_((?:sh|sz)\d{6})="([^"]*)"', resp.text):
+            parts = content.split("~")
+            if len(parts) < 39:
+                continue
+            ts = parts[30].strip()
+            if len(ts) < 8 or not ts[:8].isdigit():
+                continue
+            try:
+                close_p = float(parts[3])
+                prev_close = float(parts[4])
+                open_p = float(parts[5])
+                vol_raw = float(parts[6])
+                pct_chg = float(parts[32])
+                high_p = float(parts[33])
+                low_p = float(parts[34])
+                amt_wan = float(parts[37])
+            except ValueError:
+                continue
+            try:
+                turn = float(parts[38])
+            except ValueError:
+                turn = float("nan")
+            symbol_num = symbol[2:]
+            # 腾讯批量快照：科创板(688/689)成交量单位为股，其余板块单位为手(需×100转为股)
+            volume = vol_raw if symbol_num.startswith(("688", "689")) else vol_raw * 100.0
+            amount = amt_wan * 10000.0
+            name = parts[1].strip()
+            code = f"{symbol[:2]}.{symbol_num}"
+            parsed[code] = {
+                "date": f"{ts[:4]}-{ts[4:6]}-{ts[6:8]}",
+                "code": code,
+                "name": name,
+                "open": open_p,
+                "high": high_p,
+                "low": low_p,
+                "close": close_p,
+                "prev_close": prev_close,
+                "volume": volume,
+                "amount": amount,
+                "turn": turn,
+                "pctChg": pct_chg,
+                "isST": "1" if "ST" in name.upper() else "0",
+            }
+        return parsed
+
+    snapshots = {}
+    total_batches = max(1, len(batches))
+    p_start, p_end = progress_range
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = [pool.submit(_fetch_batch, b) for b in batches]
+        for idx, future in enumerate(as_completed(futures), 1):
+            try:
+                snapshots.update(future.result())
+            except Exception:
+                pass
+            if progress is not None:
+                ratio = p_start + (p_end - p_start) * (idx / total_batches)
+                progress.progress(ratio, text=f"批量行情截面 {idx}/{total_batches} 批（共 {len(snapshots):,} 只）")
+    return snapshots
+
+
 def update_cache(codes, start, end, progress):
-    """缺失/过期股票先走单连接 Baostock，失败项再以 6 路 HTTPS 补齐。"""
+    """方案1：交易日预检 + 批量截面极速日更 + 除权自动校验 + 连接池并发回补 + Baostock 兜底。"""
     global BAOSTOCK_AVAILABLE
     _init_cache()
-    tasks, skipped = [], 0
-    with sqlite3.connect(CACHE_DB) as conn:
+    if progress is not None:
+        progress.progress(0.02, text="正在核验最新已收盘交易日…")
+    effective_end, prev_trade_day = _recent_trade_days(end)
+    if effective_end < start:
+        return {
+            "updated": 0, "skipped": len(codes), "failed": 0,
+            "failures": [], "source": "无需更新（暂无已收盘数据）",
+            "effective_end": effective_end, "snapshot_updated": 0, "backfill_updated": 0, "ex_div": 0,
+        }
+
+    with sqlite3.connect(CACHE_DB, timeout=30) as conn:
         conn.execute("CREATE TEMP TABLE wanted (code TEXT PRIMARY KEY)")
         conn.executemany("INSERT OR IGNORE INTO wanted VALUES (?)", ((code,) for code, _ in codes))
-        state = {row[0]: row[1:] for row in conn.execute(
-            "SELECT w.code, MIN(d.date), MAX(d.date), m.start_date, m.through_date "
-            "FROM wanted w LEFT JOIN daily d ON d.code=w.code "
-            "LEFT JOIN sync_meta m ON m.code=w.code GROUP BY w.code"
-        )}
-    for code, _ in codes:
-        first, last, synced_start, synced_end = state.get(code, (None, None, None, None))
-        if first and last and first <= start and last >= end:
+        state = {
+            row[0]: row[1:]
+            for row in conn.execute(
+                """
+                WITH agg AS (
+                    SELECT w.code, MIN(d.date) AS first_d, MAX(d.date) AS last_d
+                    FROM wanted w
+                    LEFT JOIN daily d ON d.code = w.code
+                    GROUP BY w.code
+                )
+                SELECT a.code, a.first_d, a.last_d, d.close
+                FROM agg a
+                LEFT JOIN daily d ON d.code = a.code AND d.date = a.last_d
+                """
+            )
+        }
+
+    skipped = 0
+    snapshot_candidates = []
+    backfill_tasks = []
+    for code, name in codes:
+        first, last, last_close = state.get(code, (None, None, None))
+        if first and last and first <= start and last >= effective_end:
             skipped += 1
             continue
-        if synced_end and synced_start and synced_end >= end and synced_start <= start:
-            skipped += 1
-            continue
-        fetch_start = start
-        if first and first <= start and last:
-            fetch_start = max(start, (pd.Timestamp(last) - pd.Timedelta(days=7)).strftime("%Y-%m-%d"))
-        tasks.append((code, fetch_start))
+        if first and first <= start and prev_trade_day and last == prev_trade_day:
+            snapshot_candidates.append((code, name, last_close))
+        else:
+            fetch_start = start
+            if first and first <= start and last:
+                fetch_start = max(start, (pd.Timestamp(last) - pd.Timedelta(days=7)).strftime("%Y-%m-%d"))
+            backfill_tasks.append((code, name, fetch_start))
 
     successful, changed, failures = set(), set(), {}
-    total = len(tasks)
-    if BAOSTOCK_AVAILABLE is not False and tasks:
+    snapshot_updated, backfill_updated, ex_div_count = 0, 0, 0
+    used_snapshot = False
+    snap_p_end = 0.05
+
+    # 1. 批量截面极速更新：仅缺最新 1 个已收盘交易日的股票，18 次 HTTP 请求即可全部补齐
+    if snapshot_candidates:
+        snap_date = _probe_snapshot_date()
+        if snap_date == effective_end:
+            used_snapshot = True
+            snap_p_end = 0.55 if backfill_tasks else 0.95
+            snaps = _fetch_tencent_snapshots(snapshot_candidates, progress=progress, progress_range=(0.05, snap_p_end))
+            snap_rows = []
+            name_updates = []
+            for code, name, last_close in snapshot_candidates:
+                snap = snaps.get(code)
+                if not snap:
+                    backfill_tasks.append((code, name, max(start, prev_trade_day)))
+                    continue
+                if snap["name"] and snap["name"] != name:
+                    name_updates.append((code, snap["name"]))
+                # 停牌或无成交标的跳过当日写入，但视为同步成功
+                if snap["date"] != effective_end or snap["open"] <= 0 or snap["volume"] <= 0 or snap["close"] <= 0:
+                    skipped += 1
+                    successful.add(code)
+                    continue
+                # 除权/复权连续性校验：比对批量接口昨收价与本地前一交易日收盘价
+                if last_close is None or last_close <= 0:
+                    continuity_ok = False
+                else:
+                    tol = max(0.02, abs(float(last_close)) * 0.002)
+                    continuity_ok = abs(snap["prev_close"] - float(last_close)) <= tol
+                if continuity_ok:
+                    snap_rows.append(snap)
+                    snapshot_updated += 1
+                    changed.add(code)
+                    successful.add(code)
+                else:
+                    ex_div_count += 1
+                    backfill_tasks.append((code, name, start))
+
+            if snap_rows:
+                _cache_write(pd.DataFrame(snap_rows))
+            if name_updates:
+                with sqlite3.connect(CACHE_DB, timeout=30) as conn:
+                    conn.executemany("INSERT OR REPLACE INTO stock_names(code, name) VALUES (?, ?)", name_updates)
+        else:
+            # 盘中时段快照已切换至今日，而 effective_end 为前一收盘日：转入快速并发历史回补最近几日
+            recent_start = max(start, (pd.Timestamp(prev_trade_day) - pd.Timedelta(days=7)).strftime("%Y-%m-%d"))
+            for code, name, _ in snapshot_candidates:
+                backfill_tasks.append((code, name, recent_start))
+
+    # 2. 连接池并发历史回补：东方财富前复权（含换手率/成交额）-> 腾讯 fqkline 回退，每 100 只批量写库
+    if backfill_tasks:
+        em_lock = threading.Lock()
+        em_fail_streak = [0]
+        total_bf = len(backfill_tasks)
+        base_p = snap_p_end if used_snapshot else 0.05
+
+        def _fetch_one_backfill(task):
+            code, name, fetch_start = task
+            with em_lock:
+                skip_em = em_fail_streak[0] >= 12
+            if not skip_em:
+                try:
+                    frame = _history_eastmoney(code, fetch_start, effective_end, name=name)
+                    with em_lock:
+                        em_fail_streak[0] = 0
+                    return frame
+                except Exception:
+                    with em_lock:
+                        em_fail_streak[0] += 1
+            return _history_http(code, fetch_start, effective_end, name=name)
+
+        batch_frames = []
+        with ThreadPoolExecutor(max_workers=10) as pool:
+            future_map = {pool.submit(_fetch_one_backfill, t): t for t in backfill_tasks}
+            for i, future in enumerate(as_completed(future_map), 1):
+                code, name, fetch_start = future_map[future]
+                try:
+                    frame = future.result()
+                    if not frame.empty:
+                        batch_frames.append(frame)
+                        changed.add(code)
+                        backfill_updated += 1
+                    successful.add(code)
+                    failures.pop(code, None)
+                except Exception as exc:
+                    failures[code] = str(exc)
+
+                if len(batch_frames) >= 100:
+                    _cache_write(pd.concat(batch_frames, ignore_index=True))
+                    batch_frames.clear()
+                if progress is not None and (i % 10 == 0 or i == total_bf):
+                    ratio = base_p + (0.95 - base_p) * (i / total_bf)
+                    progress.progress(ratio, text=f"并发回补历史 {i}/{total_bf}（10 路连接池）")
+        if batch_frames:
+            _cache_write(pd.concat(batch_frames, ignore_index=True))
+
+    # 3. 仅针对 HTTPS 均失败的个别残余标的启用 Baostock 兜底
+    remaining = [(code, fetch_start) for code, _, fetch_start in backfill_tasks if code not in successful]
+    if remaining and BAOSTOCK_AVAILABLE is not False:
         def fetch_baostock():
             batch = []
-            for i, (code, fetch_start) in enumerate(tasks, 1):
+            tot_rem = len(remaining)
+            for i, (code, fetch_start) in enumerate(remaining, 1):
                 try:
-                    frame = _history(code, fetch_start, end)
+                    frame = _history(code, fetch_start, effective_end)
                 except Exception as exc:
                     failures[code] = str(exc)
                 else:
@@ -450,8 +819,8 @@ def update_cache(codes, start, end, progress):
                 if len(batch) >= 50:
                     _cache_write(pd.concat(batch, ignore_index=True))
                     batch.clear()
-                if i % 10 == 0 or i == total:
-                    progress.progress(i / max(1, total), text=f"Baostock 更新 {i}/{total}")
+                if progress is not None and (i % 10 == 0 or i == tot_rem):
+                    progress.progress(0.95 + 0.05 * (i / max(1, tot_rem)), text=f"Baostock 兜底 {i}/{tot_rem}")
             if batch:
                 _cache_write(pd.concat(batch, ignore_index=True))
         try:
@@ -459,32 +828,32 @@ def update_cache(codes, start, end, progress):
         except Exception:
             BAOSTOCK_AVAILABLE = False
 
-    pending = [(code, fetch_start) for code, fetch_start in tasks if code not in successful]
-    if pending:
-        with ThreadPoolExecutor(max_workers=6) as pool:
-            future_codes = {pool.submit(_history_http, code, fetch_start, end): code
-                            for code, fetch_start in pending}
-            for i, future in enumerate(as_completed(future_codes), 1):
-                code = future_codes[future]
-                try:
-                    frame = future.result()
-                    if not frame.empty:
-                        _cache_write(frame)
-                        changed.add(code)
-                    successful.add(code)
-                    failures.pop(code, None)
-                except Exception as exc:
-                    failures[code] = str(exc)
-                progress.progress(i / max(1, len(pending)), text=f"HTTPS 补齐 {i}/{len(pending)}（并发 6）")
+    if successful and effective_end >= start:
+        with sqlite3.connect(CACHE_DB, timeout=30) as conn:
+            conn.executemany(
+                "INSERT OR REPLACE INTO sync_meta(code,start_date,through_date) VALUES (?,?,?)",
+                ((code, start, effective_end) for code in successful),
+            )
 
-    with sqlite3.connect(CACHE_DB) as conn:
-        conn.executemany(
-            "INSERT OR REPLACE INTO sync_meta(code,start_date,through_date) VALUES (?,?,?)",
-            ((code, start, end) for code in successful),
-        )
-    source = "腾讯 HTTPS 并发" if BAOSTOCK_AVAILABLE is False else ("Baostock + HTTPS 回退" if pending else "Baostock")
-    return {"updated": len(changed), "skipped": skipped, "failed": len(failures),
-            "failures": list(failures.items())[:10], "source": source}
+    if used_snapshot and backfill_tasks:
+        source = "腾讯批量快照 + 并发历史回补"
+    elif used_snapshot:
+        source = "腾讯批量快照"
+    elif backfill_tasks:
+        source = "东方财富/腾讯 HTTPS 并发"
+    else:
+        source = "无需更新（已是最新）"
+    return {
+        "updated": len(changed),
+        "skipped": skipped,
+        "failed": len(failures),
+        "failures": list(failures.items())[:10],
+        "source": source,
+        "effective_end": effective_end,
+        "snapshot_updated": snapshot_updated,
+        "backfill_updated": backfill_updated,
+        "ex_div": ex_div_count,
+    }
 
 
 class AutoSyncManager:
@@ -566,25 +935,29 @@ class AutoSyncManager:
                 self._set_state(ratio=0.12 + 0.86 * min(1.0, max(0.0, ratio)), text=f"{trigger_label}：{text}")
 
         try:
-            stocks, list_date, list_source = _fetch_stock_list(today_str)
-            if stocks.empty:
+            all_codes, list_date, list_source = _get_universe_for_sync(today_str)
+            if not all_codes:
                 raise RuntimeError("未获取到可用股票列表")
-            cache_universe_save(stocks)
-            all_codes = list(stocks[["code", "code_name"]].itertuples(index=False, name=None))
-            self._set_state(ratio=0.12, text=f"{trigger_label}：已获取 {len(all_codes):,} 只标的（{list_source}），正在增量补齐今日行情…")
+            self._set_state(ratio=0.12, text=f"{trigger_label}：已就绪 {len(all_codes):,} 只标的（{list_source}），正在核对并补齐行情…")
             stats = update_cache(all_codes, start_str, today_str, _BgProgress())
             finished_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            eff_end = stats.get("effective_end", today_str)
             info = {
                 "time": finished_at,
-                "date": today_str,
+                "date": eff_end,
                 "trigger": trigger_label,
                 "updated": stats.get("updated", 0),
                 "skipped": stats.get("skipped", 0),
                 "failed": stats.get("failed", 0),
-                "source": stats.get("source", "Baostock"),
+                "snapshot_updated": stats.get("snapshot_updated", 0),
+                "ex_div": stats.get("ex_div", 0),
+                "effective_end": eff_end,
+                "source": stats.get("source", "腾讯批量快照"),
                 "status": "warning" if stats.get("failed") else "success",
             }
-            _setting_set("auto_sync_last_date", today_str)
+            # 若已完成当日收盘更新，或已过 15:00 且今天是法定节假日休市，则记录今日已完成避免重复循环
+            if eff_end >= today_str or datetime.now().strftime("%H:%M") >= "15:00":
+                _setting_set("auto_sync_last_date", today_str)
             _setting_set("auto_sync_last_info", json.dumps(info, ensure_ascii=False))
             self._set_state(ratio=1.0, text=f"{trigger_label}完成：更新 {info['updated']} 只，跳过 {info['skipped']} 只")
         except Exception as exc:
@@ -626,6 +999,59 @@ def get_auto_sync_manager():
     return mgr
 
 
+def _cache_version():
+    _init_cache()
+    with sqlite3.connect(CACHE_DB, timeout=30) as conn:
+        rows, newest = conn.execute("SELECT COUNT(*), COALESCE(MAX(date), '') FROM daily").fetchone()
+    return int(rows or 0), str(newest or "")
+
+
+@st.cache_resource(max_entries=3, show_spinner=False)
+def _load_market_arrays_cached(start, end, db_rows, db_newest):
+    """一次性从 SQLite 载入全市场行情并按股票拆分为只读 NumPy 数组字典（带版本感知内存缓存）。"""
+    _init_cache()
+    with sqlite3.connect(CACHE_DB, timeout=30) as conn:
+        rows = conn.execute(
+            "SELECT code,date,open,high,low,close,volume,amount,turn,pctChg "
+            "FROM daily WHERE date BETWEEN ? AND ? AND close IS NOT NULL ORDER BY code,date",
+            (start, end),
+        ).fetchall()
+    if not rows:
+        return {}
+
+    market = {}
+    cur_code = None
+    d_buf, o_buf, h_buf, l_buf, c_buf, v_buf, a_buf, t_buf, p_buf = [], [], [], [], [], [], [], [], []
+
+    def _flush():
+        if not cur_code or not c_buf:
+            return
+        arrs = tuple(
+            np.asarray(buf, dtype=np.float64)
+            for buf in (o_buf, h_buf, l_buf, c_buf, v_buf, a_buf, t_buf, p_buf)
+        )
+        for arr in arrs:
+            arr.setflags(write=False)
+        market[cur_code] = (tuple(d_buf), *arrs)
+
+    for code, dt, op, hi, lo, cl, vol, amt, turn, pct in rows:
+        if code != cur_code:
+            _flush()
+            cur_code = code
+            d_buf, o_buf, h_buf, l_buf, c_buf, v_buf, a_buf, t_buf, p_buf = [], [], [], [], [], [], [], [], []
+        d_buf.append(dt)
+        o_buf.append(op)
+        h_buf.append(hi)
+        l_buf.append(lo)
+        c_buf.append(cl)
+        v_buf.append(vol)
+        a_buf.append(amt)
+        t_buf.append(turn)
+        p_buf.append(pct)
+    _flush()
+    return market
+
+
 def load_cache(codes, start, end, on_progress=None):
     _init_cache()
     if on_progress:
@@ -647,6 +1073,224 @@ def load_cache(codes, start, end, on_progress=None):
     if on_progress:
         on_progress(0.22, stage=2, detail=f"已载入 {len(grouped):,} 只标的行情，开始计算技术指标与策略匹配…")
     return grouped
+
+
+def _rolling_mean_1d(arr, window):
+    n = len(arr)
+    out = np.full(n, np.nan, dtype=np.float64)
+    if n < window:
+        return out
+    if np.isnan(arr).any():
+        return pd.Series(arr).rolling(window).mean().to_numpy(dtype=np.float64)
+    cs = np.empty(n + 1, dtype=np.float64)
+    cs[0] = 0.0
+    np.cumsum(arr, out=cs[1:])
+    out[window - 1:] = (cs[window:] - cs[:-window]) / float(window)
+    return out
+
+
+def _ema_1d(arr, span):
+    n = len(arr)
+    if n == 0:
+        return np.empty(0, dtype=np.float64)
+    if np.isnan(arr).any():
+        return pd.Series(arr).ewm(span=span, adjust=False).mean().to_numpy(dtype=np.float64)
+    alpha = 2.0 / (span + 1.0)
+    one_minus = 1.0 - alpha
+    out = np.empty(n, dtype=np.float64)
+    val = float(arr[0])
+    out[0] = val
+    for idx in range(1, n):
+        val = alpha * float(arr[idx]) + one_minus * val
+        out[idx] = val
+    return out
+
+
+def _fast_indicators_np(o, h, l, c, v, amt, pct):
+    """纯 NumPy 计算技术指标，结果与 Pandas indicators() 严格一致。"""
+    n = len(c)
+    if n < 27:
+        return None
+
+    ma5 = _rolling_mean_1d(c, 5)
+    ma10 = _rolling_mean_1d(c, 10)
+    ma20 = _rolling_mean_1d(c, 20)
+    ma25 = _rolling_mean_1d(c, 25)
+    ma60 = _rolling_mean_1d(c, 60)
+
+    # RSI(14): delta[0] 为 NaN，故滚动均值从第 14 个索引开始有效
+    if np.isnan(c).any():
+        delta_s = pd.Series(c).diff()
+        gain_s, loss_s = delta_s.clip(lower=0), -delta_s.clip(upper=0)
+        ag = gain_s.rolling(14).mean().to_numpy(dtype=np.float64)
+        al = loss_s.rolling(14).mean().to_numpy(dtype=np.float64)
+    else:
+        diff = np.diff(c)
+        gain = np.where(diff > 0.0, diff, 0.0)
+        loss = np.where(diff < 0.0, -diff, 0.0)
+        ag = np.full(n, np.nan, dtype=np.float64)
+        al = np.full(n, np.nan, dtype=np.float64)
+        if n >= 15:
+            g_cs = np.empty(n, dtype=np.float64)
+            l_cs = np.empty(n, dtype=np.float64)
+            g_cs[0] = 0.0
+            l_cs[0] = 0.0
+            np.cumsum(gain, out=g_cs[1:])
+            np.cumsum(loss, out=l_cs[1:])
+            ag[14:] = (g_cs[14:] - g_cs[:-14]) / 14.0
+            al[14:] = (l_cs[14:] - l_cs[:-14]) / 14.0
+
+    rsi = np.full(n, np.nan, dtype=np.float64)
+    has_r = (~np.isnan(ag)) & (~np.isnan(al))
+    pos_l = has_r & (al > 0.0)
+    rsi[pos_l] = 100.0 - 100.0 / (1.0 + ag[pos_l] / al[pos_l])
+    rsi[has_r & (al == 0.0) & (ag > 0.0)] = 100.0
+    rsi[has_r & (al == 0.0) & (ag == 0.0)] = 50.0
+
+    ema12 = _ema_1d(c, 12)
+    ema26 = _ema_1d(c, 26)
+    macd = ema12 - ema26
+    sig = _ema_1d(macd, 9)
+
+    if np.isnan(l).any() or np.isnan(h).any():
+        low9 = pd.Series(l).rolling(9).min().to_numpy(dtype=np.float64)
+        high9 = pd.Series(h).rolling(9).max().to_numpy(dtype=np.float64)
+    else:
+        low9 = np.full(n, np.nan, dtype=np.float64)
+        high9 = np.full(n, np.nan, dtype=np.float64)
+        low9[8:] = np.min(np.lib.stride_tricks.sliding_window_view(l, 9), axis=1)
+        high9[8:] = np.max(np.lib.stride_tricks.sliding_window_view(h, 9), axis=1)
+
+    diff_hl = high9 - low9
+    k_arr = np.full(n, np.nan, dtype=np.float64)
+    valid_hl = (~np.isnan(diff_hl)) & (diff_hl != 0.0) & (~np.isnan(c))
+    k_arr[valid_hl] = 100.0 * (c[valid_hl] - low9[valid_hl]) / diff_hl[valid_hl]
+
+    d_arr = np.full(n, np.nan, dtype=np.float64)
+    if n >= 11:
+        d_arr[10:] = (k_arr[8:-2] + k_arr[9:-1] + k_arr[10:]) / 3.0
+
+    vol_ma5 = _rolling_mean_1d(v, 5)
+    vol_ma20 = _rolling_mean_1d(v, 20)
+
+    valid = ~(np.isnan(ma25) | np.isnan(rsi) | np.isnan(macd) | np.isnan(sig) | np.isnan(k_arr) | np.isnan(d_arr))
+    if valid[24:].all():
+        if n - 24 < 3:
+            return None
+        sl = slice(24, None)
+        return (
+            o[sl], h[sl], l[sl], c[sl], v[sl], amt[sl], pct[sl],
+            ma5[sl], ma10[sl], ma20[sl], ma25[sl], ma60[sl],
+            rsi[sl], macd[sl], sig[sl], k_arr[sl], d_arr[sl],
+            vol_ma5[sl], vol_ma20[sl],
+        )
+
+    if int(valid.sum()) < 3:
+        return None
+    return (
+        o[valid], h[valid], l[valid], c[valid], v[valid], amt[valid], pct[valid],
+        ma5[valid], ma10[valid], ma20[valid], ma25[valid], ma60[valid],
+        rsi[valid], macd[valid], sig[valid], k_arr[valid], d_arr[valid],
+        vol_ma5[valid], vol_ma20[valid],
+    )
+
+
+def _eval_strategies_np(feat, strategies):
+    """按需只计算用户勾选的策略（排除 RPS），避免无效分支开销。"""
+    o, h, l, c, v, amt, pct, ma5, ma10, ma20, ma25, ma60, rsi, macd, sig, k_arr, d_arr, vol_ma5, vol_ma20 = feat
+    matched = []
+    cross_ma = None
+    cross_macd = None
+    cross_kdj = None
+    recent_limit = None
+
+    for name in strategies:
+        ok = False
+        if name == "底部趋势拐点":
+            ok = rsi[-1] < 38 and c[-1] > o[-1] and macd[-1] > macd[-2] and v[-1] > vol_ma5[-1]
+        elif name == "涨停回马枪策略":
+            if recent_limit is None:
+                ret = np.nan_to_num(pct, nan=0.0)
+                recent_limit = bool((ret[-11:-1] >= 9.5).any())
+            ok = recent_limit and c[-1] > o[-1] and c[-1] > ma5[-1] and v[-1] < vol_ma20[-1]
+        elif name == "涨停横盘策略":
+            if recent_limit is None:
+                ret = np.nan_to_num(pct, nan=0.0)
+                recent_limit = bool((ret[-11:-1] >= 9.5).any())
+            ok = (
+                recent_limit
+                and len(c) >= 6
+                and (np.std(c[-5:], ddof=1) / c[-1] < 0.04)
+                and c[-1] > np.nanmax(h[-6:-1])
+            )
+        elif name == "启明星策略":
+            ok = (
+                c[-3] < o[-3]
+                and abs(c[-2] - o[-2]) < (o[-3] - c[-3]) * 0.5
+                and c[-1] > (o[-3] + c[-3]) / 2.0
+            )
+        elif name in ("多金叉共振", "金三角策略"):
+            if cross_ma is None:
+                cross_ma = bool(ma5[-2] <= ma10[-2] and ma5[-1] > ma10[-1])
+            if cross_macd is None:
+                cross_macd = bool(macd[-2] <= sig[-2] and macd[-1] > sig[-1])
+            if cross_kdj is None:
+                cross_kdj = bool(k_arr[-2] <= d_arr[-2] and k_arr[-1] > d_arr[-1])
+            ok = cross_ma and cross_macd and cross_kdj
+        elif name == "多方炮策略":
+            ok = c[-3] > o[-3] and c[-2] < o[-2] and c[-1] > o[-1] and c[-1] > c[-3]
+        elif name == "阻力位突破策略":
+            ok = h[-21:-1].size > 0 and c[-1] > np.nanmax(h[-21:-1]) and v[-1] > vol_ma20[-1] * 1.5
+        elif name == "强势洗盘弱转强":
+            ok = c[-1] > o[-1] and c[-1] > h[-2] and c[-2] < o[-2] and ma5[-1] > ma20[-1]
+        elif name == "趋势加速拐点":
+            ok = ma5[-1] > ma5[-2] > ma5[-3] and pct[-1] > 3 and v[-1] > vol_ma20[-1] * 1.3
+        elif name == "仙人指路策略":
+            ok = (h[-1] - max(o[-1], c[-1])) > abs(c[-1] - o[-1]) * 1.8 and c[-1] > ma20[-1]
+        elif name == "W底策略":
+            ok = (
+                l[-10:-5].size > 0
+                and l[-5:-1].size > 0
+                and h[-10:-1].size > 0
+                and abs(np.nanmin(l[-10:-5]) - np.nanmin(l[-5:-1])) / c[-1] < 0.04
+                and c[-1] > np.nanmax(h[-10:-1])
+            )
+        elif name == "趋势起点策略":
+            if cross_ma is None:
+                cross_ma = bool(ma5[-2] <= ma10[-2] and ma5[-1] > ma10[-1])
+            ok = cross_ma and ma20[-1] > ma20[-2]
+        elif name == "2560战法":
+            ok = c[-1] > ma25[-1] and v[-1] > vol_ma5[-1] > vol_ma20[-1]
+        elif name == "金叉不绿策略":
+            if cross_ma is None:
+                cross_ma = bool(ma5[-2] <= ma10[-2] and ma5[-1] > ma10[-1])
+            ok = cross_ma and c[-1] >= o[-1]
+        elif name == "海龟突破策略":
+            ok = (
+                h[-21:-1].size > 0
+                and c[-1] > np.nanmax(h[-21:-1])
+                and amt[-1] > 100_000_000
+                and c[-1] > o[-1]
+                and c[-1] > c[-2]
+            )
+        elif name == "高旗形整理策略":
+            ok = (
+                l[-40:].size > 0
+                and l[-10:].size > 0
+                and v[-21:-1].size > 0
+                and np.nanmax(h[-40:]) / np.nanmin(l[-40:]) > 1.6
+                and np.nanmax(h[-10:]) / np.nanmin(l[-10:]) < 1.15
+                and np.nanmin(l[-10:]) >= np.nanmax(h[-40:]) * 0.8
+                and v[-1] < np.nanmean(v[-21:-1]) * 0.6
+            )
+        elif name == "涨停洗盘策略":
+            ok = c[-2] >= c[-3] * 1.095 and c[-1] < o[-1] and v[-1] > v[-2] * 2 and l[-1] >= c[-2]
+        elif name == "上升趋势跌停反包":
+            ok = ma20[-2] > ma60[-2] and c[-1] <= c[-2] * 0.905 and v[-1] > vol_ma20[-1] * 2
+
+        if bool(ok):
+            matched.append((name, STRATEGIES[name]))
+    return matched
 
 
 def indicators(frame):
@@ -675,38 +1319,57 @@ def strategy_signal(frame, name, d=None):
     if len(d) < 3:
         return False, "数据不足"
     x, p, p2 = d.iloc[-1], d.iloc[-2], d.iloc[-3]
-    ret = d.pctChg.fillna(0)
-    recent_limit = (ret.iloc[-11:-1] >= 9.5).any()
-    cross_ma = p.ma5 <= p.ma10 and x.ma5 > x.ma10
-    cross_macd = p.macd <= p.signal and x.macd > x.signal
-    cross_kdj = p.k <= p.d and x.k > x.d
-    rules = {
-        "底部趋势拐点": x.rsi < 38 and x.close > x.open and x.macd > p.macd and x.volume > x.vol_ma5,
-        "涨停回马枪策略": recent_limit and x.close > x.open and x.close > x.ma5 and x.volume < x.vol_ma20,
-        "涨停横盘策略": recent_limit and d.close.iloc[-5:].std() / x.close < .04 and x.close > d.high.iloc[-6:-1].max(),
-        "启明星策略": p2.close < p2.open and abs(p.close - p.open) < (p2.open - p2.close) * .5 and x.close > (p2.open + p2.close) / 2,
-        "多金叉共振": cross_ma and cross_macd and cross_kdj,
-        "多方炮策略": p2.close > p2.open and p.close < p.open and x.close > x.open and x.close > p2.close,
-        "阻力位突破策略": x.close > d.high.iloc[-21:-1].max() and x.volume > x.vol_ma20 * 1.5,
-        "强势洗盘弱转强": x.close > x.open and x.close > p.high and p.close < p.open and x.ma5 > x.ma20,
-        "趋势加速拐点": x.ma5 > p.ma5 > p2.ma5 and x.pctChg > 3 and x.volume > x.vol_ma20 * 1.3,
-        "仙人指路策略": (x.high - max(x.open, x.close)) > abs(x.close - x.open) * 1.8 and x.close > x.ma20,
-        "W底策略": abs(d.low.iloc[-10:-5].min() - d.low.iloc[-5:-1].min()) / x.close < .04 and x.close > d.high.iloc[-10:-1].max(),
-        "趋势起点策略": cross_ma and x.ma20 > p.ma20,
-        "2560战法": x.close > x.ma25 and x.volume > x.vol_ma5 > x.vol_ma20,
-        "金三角策略": cross_ma and cross_macd and cross_kdj,
-        "金叉不绿策略": cross_ma and x.close >= x.open,
-        "海龟突破策略": x.close > d.high.iloc[-21:-1].max() and x.amount > 100_000_000 and x.close > x.open and x.close > p.close,
-        "高旗形整理策略": (
+    if name == "底部趋势拐点":
+        matched = x.rsi < 38 and x.close > x.open and x.macd > p.macd and x.volume > x.vol_ma5
+    elif name == "涨停回马枪策略":
+        recent_limit = (d.pctChg.fillna(0).iloc[-11:-1] >= 9.5).any()
+        matched = recent_limit and x.close > x.open and x.close > x.ma5 and x.volume < x.vol_ma20
+    elif name == "涨停横盘策略":
+        recent_limit = (d.pctChg.fillna(0).iloc[-11:-1] >= 9.5).any()
+        matched = recent_limit and d.close.iloc[-5:].std() / x.close < .04 and x.close > d.high.iloc[-6:-1].max()
+    elif name == "启明星策略":
+        matched = p2.close < p2.open and abs(p.close - p.open) < (p2.open - p2.close) * .5 and x.close > (p2.open + p2.close) / 2
+    elif name in ("多金叉共振", "金三角策略"):
+        cross_ma = p.ma5 <= p.ma10 and x.ma5 > x.ma10
+        cross_macd = p.macd <= p.signal and x.macd > x.signal
+        cross_kdj = p.k <= p.d and x.k > x.d
+        matched = cross_ma and cross_macd and cross_kdj
+    elif name == "多方炮策略":
+        matched = p2.close > p2.open and p.close < p.open and x.close > x.open and x.close > p2.close
+    elif name == "阻力位突破策略":
+        matched = x.close > d.high.iloc[-21:-1].max() and x.volume > x.vol_ma20 * 1.5
+    elif name == "强势洗盘弱转强":
+        matched = x.close > x.open and x.close > p.high and p.close < p.open and x.ma5 > x.ma20
+    elif name == "趋势加速拐点":
+        matched = x.ma5 > p.ma5 > p2.ma5 and x.pctChg > 3 and x.volume > x.vol_ma20 * 1.3
+    elif name == "仙人指路策略":
+        matched = (x.high - max(x.open, x.close)) > abs(x.close - x.open) * 1.8 and x.close > x.ma20
+    elif name == "W底策略":
+        matched = abs(d.low.iloc[-10:-5].min() - d.low.iloc[-5:-1].min()) / x.close < .04 and x.close > d.high.iloc[-10:-1].max()
+    elif name == "趋势起点策略":
+        cross_ma = p.ma5 <= p.ma10 and x.ma5 > x.ma10
+        matched = cross_ma and x.ma20 > p.ma20
+    elif name == "2560战法":
+        matched = x.close > x.ma25 and x.volume > x.vol_ma5 > x.vol_ma20
+    elif name == "金叉不绿策略":
+        cross_ma = p.ma5 <= p.ma10 and x.ma5 > x.ma10
+        matched = cross_ma and x.close >= x.open
+    elif name == "海龟突破策略":
+        matched = x.close > d.high.iloc[-21:-1].max() and x.amount > 100_000_000 and x.close > x.open and x.close > p.close
+    elif name == "高旗形整理策略":
+        matched = (
             d.high.iloc[-40:].max() / d.low.iloc[-40:].min() > 1.6
             and d.high.iloc[-10:].max() / d.low.iloc[-10:].min() < 1.15
             and d.low.iloc[-10:].min() >= d.high.iloc[-40:].max() * .8
             and x.volume < d.volume.iloc[-21:-1].mean() * .6
-        ),
-        "涨停洗盘策略": p.close >= p2.close * 1.095 and x.close < x.open and x.volume > p.volume * 2 and x.low >= p.close,
-        "上升趋势跌停反包": p.ma20 > p.ma60 and x.close <= p.close * .905 and x.volume > x.vol_ma20 * 2,
-    }
-    return bool(rules.get(name, False)), STRATEGIES[name]
+        )
+    elif name == "涨停洗盘策略":
+        matched = p.close >= p2.close * 1.095 and x.close < x.open and x.volume > p.volume * 2 and x.low >= p.close
+    elif name == "上升趋势跌停反包":
+        matched = p.ma20 > p.ma60 and x.close <= p.close * .905 and x.volume > x.vol_ma20 * 2
+    else:
+        matched = False
+    return bool(matched), STRATEGIES.get(name, "")
 
 
 def screen(codes, frames, strategies, min_change, min_turn, max_turn, on_progress=None, window_start=None):
@@ -714,7 +1377,9 @@ def screen(codes, frames, strategies, min_change, min_turn, max_turn, on_progres
     sparks = {}
     stats = {"ready": 0, "missing": 0, "short": 0}
     fallback_progress = None if on_progress else st.progress(0, text="正在读取本地行情…")
-    window_start_ts = pd.Timestamp(window_start) if window_start is not None else None
+    window_start_str = pd.Timestamp(window_start).strftime("%Y-%m-%d") if window_start is not None else None
+    non_rps = [s for s in strategies if s != "RPS强势突破"]
+    need_rps = "RPS强势突破" in strategies
 
     def _emit(ratio, stage, detail, hits=0, scanned=0, total=0):
         if on_progress:
@@ -722,71 +1387,118 @@ def screen(codes, frames, strategies, min_change, min_turn, max_turn, on_progres
         elif fallback_progress is not None:
             fallback_progress.progress(min(1.0, max(0.0, ratio)), text=detail)
 
-    def _record_spark(code, frame):
+    def _record_spark(code, close_arr):
         if code not in sparks:
-            sparks[code] = [round(float(v), 2) for v in frame.close.tail(20).dropna().tolist()]
+            tail = close_arr[-20:]
+            sparks[code] = [round(float(v), 2) for v in tail if not np.isnan(v)]
 
     def run():
-        rps_frames = {}
+        rps_pool = {}
         total_codes = max(1, len(codes))
         last_tick = 0.0
         for i, (code, name) in enumerate(codes, 1):
-            frame = frames.get(code)
-            if frame is None or frame.empty:
+            item = frames.get(code)
+            if item is None:
                 stats["missing"] += 1
-            elif window_start_ts is not None and frame["date"].max() < window_start_ts:
-                # 所选日期区间内无任何交易记录（如长期停牌），不拿陈旧历史冒充当期信号
-                stats["missing"] += 1
-            elif len(frame) < 70:
-                stats["short"] += 1
+            elif isinstance(item, pd.DataFrame):
+                if item.empty:
+                    stats["missing"] += 1
+                else:
+                    last_dt = item["date"].iloc[-1]
+                    last_dt_str = last_dt.strftime("%Y-%m-%d") if hasattr(last_dt, "strftime") else str(last_dt)[:10]
+                    if window_start_str is not None and last_dt_str < window_start_str:
+                        stats["missing"] += 1
+                    elif len(item) < 70:
+                        stats["short"] += 1
+                    else:
+                        stats["ready"] += 1
+                        o = item["open"].to_numpy(dtype=np.float64)
+                        h = item["high"].to_numpy(dtype=np.float64)
+                        l = item["low"].to_numpy(dtype=np.float64)
+                        c = item["close"].to_numpy(dtype=np.float64)
+                        v = item["volume"].to_numpy(dtype=np.float64)
+                        amt = item["amount"].to_numpy(dtype=np.float64)
+                        t = item["turn"].to_numpy(dtype=np.float64)
+                        pct = item["pctChg"].to_numpy(dtype=np.float64)
+                        last_close = float(c[-1])
+                        last_turn = float(t[-1])
+                        last_pct = float(pct[-1])
+                        if need_rps and len(c) >= 121:
+                            rps_pool[code] = (name, c, h, last_close, last_turn, last_pct)
+                        turn_ok = np.isnan(last_turn) or (min_turn <= last_turn <= max_turn)
+                        pct_ok = (not np.isnan(last_pct)) and (last_pct >= min_change)
+                        if non_rps and pct_ok and turn_ok:
+                            feat = _fast_indicators_np(o, h, l, c, v, amt, pct)
+                            if feat is not None:
+                                for strategy, reason in _eval_strategies_np(feat, non_rps):
+                                    _record_spark(code, c)
+                                    rows.append({
+                                        "策略": strategy, "代码": code, "名称": name,
+                                        "收盘": last_close, "涨跌幅%": last_pct,
+                                        "换手率%": last_turn if not np.isnan(last_turn) else float("nan"),
+                                        "信号说明": reason,
+                                    })
             else:
-                stats["ready"] += 1
-                if "RPS强势突破" in strategies and len(frame) >= 121:
-                    rps_frames[code] = (name, frame)
-                last = frame.iloc[-1]
-                turn = last.turn
-                turn_ok = pd.isna(turn) or min_turn <= turn <= max_turn
-                features = indicators(frame)
-                for strategy in strategies:
-                    matched, reason = strategy_signal(frame, strategy, features)
-                    if matched and last.pctChg >= min_change and turn_ok:
-                        _record_spark(code, frame)
-                        rows.append({"策略": strategy, "代码": code, "名称": name,
-                                     "收盘": float(last.close), "涨跌幅%": float(last.pctChg),
-                                     "换手率%": float(turn) if pd.notna(turn) else float("nan"),
-                                     "信号说明": reason})
+                dates, o, h, l, c, v, amt, t, pct = item
+                n_bars = len(c)
+                if n_bars == 0:
+                    stats["missing"] += 1
+                elif window_start_str is not None and dates[-1] < window_start_str:
+                    stats["missing"] += 1
+                elif n_bars < 70:
+                    stats["short"] += 1
+                else:
+                    stats["ready"] += 1
+                    last_close = float(c[-1])
+                    last_turn = float(t[-1])
+                    last_pct = float(pct[-1])
+                    if need_rps and n_bars >= 121:
+                        rps_pool[code] = (name, c, h, last_close, last_turn, last_pct)
+                    turn_ok = np.isnan(last_turn) or (min_turn <= last_turn <= max_turn)
+                    pct_ok = (not np.isnan(last_pct)) and (last_pct >= min_change)
+                    if non_rps and pct_ok and turn_ok:
+                        feat = _fast_indicators_np(o, h, l, c, v, amt, pct)
+                        if feat is not None:
+                            for strategy, reason in _eval_strategies_np(feat, non_rps):
+                                _record_spark(code, c)
+                                rows.append({
+                                    "策略": strategy, "代码": code, "名称": name,
+                                    "收盘": last_close, "涨跌幅%": last_pct,
+                                    "换手率%": last_turn if not np.isnan(last_turn) else float("nan"),
+                                    "信号说明": reason,
+                                })
 
             now = time.monotonic()
-            if i == total_codes or i % 60 == 0 or (now - last_tick) >= 0.14:
+            if i == total_codes or i % 500 == 0 or (now - last_tick) >= 0.25:
                 last_tick = now
-                pct = 0.22 + 0.72 * (i / total_codes)
+                pct_done = 0.22 + 0.72 * (i / total_codes)
                 _emit(
-                    pct,
+                    pct_done,
                     stage=2,
-                    detail=f"正在逐股计算指标与匹配策略（当前：{code} {name}）",
+                    detail=f"正在极速计算指标与匹配策略（当前：{code} {name}）",
                     hits=len(rows),
                     scanned=i,
                     total=total_codes,
                 )
 
-        if rps_frames:
-            _emit(0.96, stage=3, detail=f"正在对 {len(rps_frames):,} 只标的执行 120 日 RPS 相对强度排名…",
+        if rps_pool:
+            _emit(0.96, stage=3, detail=f"正在对 {len(rps_pool):,} 只标的执行 120 日 RPS 相对强度排名…",
                   hits=len(rows), scanned=total_codes, total=total_codes)
-            returns = pd.Series({code: frame.close.iloc[-1] / frame.close.iloc[-121] - 1
-                                 for code, (_, frame) in rps_frames.items()})
-            ranks = returns.rank(pct=True) * 100
+            returns = pd.Series({code: vals[1][-1] / vals[1][-121] - 1.0 for code, vals in rps_pool.items()})
+            ranks = returns.rank(pct=True) * 100.0
             for code, rank in ranks.items():
-                name, frame = rps_frames[code]
-                last = frame.iloc[-1]
-                breakout = last.close >= frame.high.iloc[-120:].max() * .9
-                turn = last.turn
-                turn_ok = pd.isna(turn) or min_turn <= turn <= max_turn
-                if rank >= 90 and breakout and last.pctChg >= min_change and turn_ok:
-                    _record_spark(code, frame)
-                    rows.append({"策略": "RPS强势突破", "代码": code, "名称": name,
-                                 "收盘": float(last.close), "涨跌幅%": float(last.pctChg),
-                                 "换手率%": float(turn) if pd.notna(turn) else float("nan"),
-                                 "信号说明": f"本次扫描样本 RPS {rank:.1f}，收盘处于 120 日高点 90% 内"})
+                name, c, h, last_close, last_turn, last_pct = rps_pool[code]
+                breakout = last_close >= float(np.nanmax(h[-120:])) * 0.9
+                turn_ok = np.isnan(last_turn) or (min_turn <= last_turn <= max_turn)
+                pct_ok = (not np.isnan(last_pct)) and (last_pct >= min_change)
+                if rank >= 90 and breakout and pct_ok and turn_ok:
+                    _record_spark(code, c)
+                    rows.append({
+                        "策略": "RPS强势突破", "代码": code, "名称": name,
+                        "收盘": last_close, "涨跌幅%": last_pct,
+                        "换手率%": last_turn if not np.isnan(last_turn) else float("nan"),
+                        "信号说明": f"本次扫描样本 RPS {rank:.1f}，收盘处于 120 日高点 90% 内",
+                    })
 
         _emit(0.99, stage=3, detail="正在排序信号榜并生成迷你走势数据…",
               hits=len(rows), scanned=total_codes, total=total_codes)
@@ -1782,55 +2494,66 @@ def _run_update_action(start, end):
     if not SYNC_LOCK.acquire(blocking=False):
         st.info("后台正在执行自动行情更新，请稍候完成后再试。")
         return
-    tracker = FloatingProgress("正在更新全市场行情缓存", ("获取股票列表", "同步历史日线", "写入本地库"))
+    end_str = end.strftime("%Y-%m-%d")
+    tracker = FloatingProgress("正在更新全市场行情缓存", ("校验交易日与股票池", "批量截面/并发拉取", "写入本地库"))
     try:
-        tracker.update(0.05, stage=1, detail="正在连接数据源获取最新 A 股股票列表…")
+        tracker.update(0.05, stage=1, detail="正在加载股票池并核对最近已收盘交易日…")
         try:
-            stocks, list_date, list_source = stock_list(end.strftime("%Y-%m-%d"))
+            all_codes, list_date, list_source = _get_universe_for_sync(end_str)
         except Exception as exc:
             tracker.close()
             st.error(f"获取股票列表失败：{exc}")
             return
-        if stocks.empty:
+        if not all_codes:
             tracker.close()
             st.error("所选日期及之前 10 天内都没有可用的股票列表，请稍后重试。")
             return
-        cache_universe_save(stocks)
-        all_codes = list(stocks[["code", "code_name"]].itertuples(index=False, name=None))
-        tracker.update(0.15, stage=2, detail=f"已获取 {len(all_codes):,} 只股票（来源：{list_source}），正在检查本地缓存区间…")
-        update_stats = update_cache(all_codes, start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"), tracker)
+        tracker.update(0.15, stage=2, detail=f"已就绪 {len(all_codes):,} 只股票（来源：{list_source}），正在检查本地缓存区间…")
+        update_stats = update_cache(all_codes, start.strftime("%Y-%m-%d"), end_str, tracker)
         tracker.update(1.0, stage=3, detail="全市场行情同步完成！")
         time.sleep(0.2)
     finally:
         tracker.close()
         SYNC_LOCK.release()
 
-    if end >= date.today():
-        today_str = date.today().strftime("%Y-%m-%d")
+    eff_end = update_stats.get("effective_end", end_str)
+    today_str = date.today().strftime("%Y-%m-%d")
+    if eff_end >= today_str:
         _setting_set("auto_sync_last_date", today_str)
         _setting_set("auto_sync_last_info", json.dumps({
             "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "date": today_str,
+            "date": eff_end,
             "trigger": "手动全市场更新",
             "updated": update_stats.get("updated", 0),
             "skipped": update_stats.get("skipped", 0),
             "failed": update_stats.get("failed", 0),
-            "source": update_stats.get("source", "Baostock"),
+            "snapshot_updated": update_stats.get("snapshot_updated", 0),
+            "ex_div": update_stats.get("ex_div", 0),
+            "source": update_stats.get("source", "腾讯批量快照"),
             "status": "warning" if update_stats.get("failed") else "success",
         }, ensure_ascii=False))
 
-    if list_date != end.strftime("%Y-%m-%d"):
-        st.info(f"{end:%Y-%m-%d} 的股票列表尚未发布，已使用最近可用列表日期：{list_date}。行情仍按所选结束日期查询。")
-    if list_source != "Baostock":
-        st.info(f"Baostock 登录不可用，股票列表来源已自动切换：{list_source}。")
+    if eff_end < end_str:
+        st.info(f"当前仍在交易时段或 {end_str} 非交易日，已自动同步至最近已收盘交易日：{eff_end}。")
+    if list_source not in ("Baostock", "本地股票池缓存"):
+        st.info(f"股票列表来源：{list_source}（下次 7 天内将直接复用本地股票池缓存）。")
     st.session_state["update_stats"] = update_stats
     for key in ("result", "scan_count", "scan_stats", "history_source", "sparks"):
         st.session_state.pop(key, None)
+
+    detail_parts = [f"新增/更新 {update_stats['updated']} 只"]
+    if update_stats.get("snapshot_updated"):
+        detail_parts.append(f"极速截面 {update_stats['snapshot_updated']} 只")
+    if update_stats.get("ex_div"):
+        detail_parts.append(f"除权自动回补 {update_stats['ex_div']} 只")
+    detail_parts.append(f"跳过 {update_stats['skipped']} 只")
+    summary_text = "，".join(detail_parts)
+
     if update_stats["failed"]:
-        st.warning(f"缓存更新完成，但 {update_stats['failed']} 只股票更新失败；示例：{update_stats['failures'][:3]}")
+        st.warning(f"缓存更新完成（{summary_text}），但 {update_stats['failed']} 只股票更新失败；示例：{update_stats['failures'][:3]}")
     else:
-        st.toast(f"行情缓存更新完成：新增/更新 {update_stats['updated']} 只，跳过 {update_stats['skipped']} 只", icon="✅")
-        st.success(f"行情缓存已更新：新增/更新 {update_stats['updated']} 只，已跳过 {update_stats['skipped']} 只。")
+        st.toast(f"行情缓存更新完成：{summary_text}", icon="✅")
+        st.success(f"行情缓存已更新：{summary_text}（通道：{update_stats.get('source', '自动')}）。")
 
 
 def _run_screen_action(start, end, strategies, min_change, min_turn, max_turn, max_stocks):
@@ -1851,11 +2574,16 @@ def _run_screen_action(start, end, strategies, min_change, min_turn, max_turn, m
         selected = universe[::stride][:limit]
         # 为保证 MA60/MACD/RSI/RPS 等指标充分预热且数据精准，后台自动向前多读取前置历史行情
         lookback_start = min(start, end - timedelta(days=210))
-        frames = load_cache(selected, lookback_start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"), on_progress=tracker.update)
+        db_rows, db_newest = _cache_version()
+        tracker.update(0.08, stage=1, detail=f"正在从本地缓存加载全市场行情（共 {db_rows:,} 条记录）…")
+        frames = _load_market_arrays_cached(
+            lookback_start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"), db_rows, db_newest
+        )
         if not frames:
             tracker.close()
             st.error("本地没有所选日期范围的行情数据，请先点击「更新全市场行情缓存」。")
             return
+        tracker.update(0.22, stage=2, detail=f"已就绪 {len(frames):,} 只标的行情，开始极速策略扫描…")
         result, scan_stats = screen(
             selected, frames, strategies, min_change, min_turn, max_turn,
             on_progress=tracker.update, window_start=start,
@@ -2450,19 +3178,19 @@ elif active_tab == "数据源与缓存中心":
     </div>
     <div class="pipe-grid">
         <div class="pipe-card">
-            <div class="pipe-step">STAGE 01 · PRIMARY</div>
-            <div class="pipe-title">Baostock 证券宝主通道</div>
-            <div class="pipe-desc">单连接拉取前复权日线（含开高低收、成交量、成交额、换手率、涨跌幅与 ST 标识），字段最完整。</div>
+            <div class="pipe-step">STAGE 01 · BATCH SNAPSHOT</div>
+            <div class="pipe-title">腾讯批量截面极速日更 + 除权校验</div>
+            <div class="pipe-desc">日常收盘后仅需 18 次并发请求（每次 300 只）即可秒级补齐全市场 OHLCV 与换手率，自动比对昨收价识别除权并触发重拉。</div>
         </div>
         <div class="pipe-card">
-            <div class="pipe-step">STAGE 02 · LIST FALLBACK</div>
-            <div class="pipe-title">同花顺 / 腾讯实时证券列表</div>
-            <div class="pipe-desc">当 Baostock 10030 端口受限时，自动切换同花顺公开列表或腾讯实时报价接口核验全市场 A 股代码。</div>
+            <div class="pipe-step">STAGE 02 · SMART PRECHECK</div>
+            <div class="pipe-title">交易日预检 + 股票池 7 天缓存</div>
+            <div class="pipe-desc">更新前先探测上证指数最近已收盘交易日，盘中/休市不误写、不空跑；全市场证券列表缓存 7 天复用，告别反复全量查询。</div>
         </div>
         <div class="pipe-card">
-            <div class="pipe-step">STAGE 03 · 6x CONCURRENT</div>
-            <div class="pipe-title">腾讯财经 HTTPS 6 路并发补齐</div>
-            <div class="pipe-desc">对主通道失败或缺失标的自动启动 6 线程 HTTPS 并发回补（换手率缺省项在选股时自动温和跳过）。</div>
+            <div class="pipe-step">STAGE 03 · 10x POOLED BACKFILL</div>
+            <div class="pipe-title">东方财富 / 腾讯连接池回补 + Baostock 兜底</div>
+            <div class="pipe-desc">多日缺口或除权标的走 10 路连接池并发拉取前复权历史（每 100 只批量写库），残余异常项自动由 Baostock 兜底补齐。</div>
         </div>
     </div>
     """, unsafe_allow_html=True)
