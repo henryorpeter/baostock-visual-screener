@@ -26,8 +26,18 @@ DAILY_FIELDS = "date,code,open,high,low,close,volume,amount,turn,pctChg,isST"
 BAOSTOCK_AVAILABLE = None
 CACHE_DB = Path(__file__).with_name("stock_cache.sqlite3")
 SYNC_LOCK = threading.Lock()
+_INIT_LOCK = threading.Lock()
+_CACHE_INITIALIZED = False
+_STATUS_LOCK = threading.Lock()
+_STATUS_CACHE = {"ts": 0.0, "data": None}
 _THREAD_LOCAL = threading.local()
 AUTO_SYNC_TIMES = ["15:15", "15:30", "15:35", "16:00", "17:00", "18:00", "20:00"]
+
+
+def _invalidate_status_cache():
+    with _STATUS_LOCK:
+        _STATUS_CACHE["ts"] = 0.0
+        _STATUS_CACHE["data"] = None
 
 
 def _http_session():
@@ -43,16 +53,26 @@ def _http_session():
 
 
 def _init_cache():
-    with sqlite3.connect(CACHE_DB, timeout=30) as conn:
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("""CREATE TABLE IF NOT EXISTS daily (
-            code TEXT NOT NULL, date TEXT NOT NULL, open REAL, high REAL, low REAL,
-            close REAL, volume REAL, amount REAL, turn REAL, pctChg REAL, isST TEXT,
-            PRIMARY KEY (code, date))""")
-        conn.execute("CREATE TABLE IF NOT EXISTS sync_meta (code TEXT PRIMARY KEY, start_date TEXT NOT NULL, through_date TEXT NOT NULL)")
-        conn.execute("CREATE TABLE IF NOT EXISTS stock_names (code TEXT PRIMARY KEY, name TEXT NOT NULL)")
-        conn.execute("CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_daily_code_date ON daily(code,date)")
+    global _CACHE_INITIALIZED
+    if _CACHE_INITIALIZED and CACHE_DB.exists():
+        return
+    with _INIT_LOCK:
+        if _CACHE_INITIALIZED and CACHE_DB.exists():
+            return
+        with sqlite3.connect(CACHE_DB, timeout=30) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("""CREATE TABLE IF NOT EXISTS daily (
+                code TEXT NOT NULL, date TEXT NOT NULL, open REAL, high REAL, low REAL,
+                close REAL, volume REAL, amount REAL, turn REAL, pctChg REAL, isST TEXT,
+                PRIMARY KEY (code, date))""")
+            conn.execute("CREATE TABLE IF NOT EXISTS sync_meta (code TEXT PRIMARY KEY, start_date TEXT NOT NULL, through_date TEXT NOT NULL)")
+            conn.execute("CREATE TABLE IF NOT EXISTS stock_names (code TEXT PRIMARY KEY, name TEXT NOT NULL)")
+            conn.execute("CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            conn.execute("CREATE TABLE IF NOT EXISTS watchlist (code TEXT PRIMARY KEY, name TEXT NOT NULL, added_at TEXT NOT NULL)")
+            # 主键 (code, date) 已覆盖该组合索引，移除冗余索引并补建 date 索引以加速区间查询与 MAX(date)
+            conn.execute("DROP INDEX IF EXISTS idx_daily_code_date")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_daily_date ON daily(date)")
+        _CACHE_INITIALIZED = True
 
 
 def _setting_get(key, default=None):
@@ -117,6 +137,7 @@ def _cache_write(frame):
             "INSERT OR REPLACE INTO daily (date,code,open,high,low,close,volume,amount,turn,pctChg,isST) "
             "VALUES (?,?,?,?,?,?,?,?,?,?,?)", data.itertuples(index=False, name=None),
         )
+    _invalidate_status_cache()
 
 
 STRATEGIES = {
@@ -133,7 +154,7 @@ STRATEGIES = {
     "W底策略": "双底后颈线突破",
     "趋势起点策略": "短均线向上突破长均线",
     "2560战法": "突破 MA25 + 均量金叉",
-    "金三角策略": "均线/MACD/KDJ 三点共振",
+    "金三角策略": "均线多头价托初成 + 放量阳线确认",
     "金叉不绿策略": "均线金叉且阳线确认",
     "海龟突破策略": "突破前 20 日高点、放量并收阳",
     "高旗形整理策略": "强势上涨后高位收敛并缩量",
@@ -461,15 +482,19 @@ def _history_eastmoney(code, start, end, name=""):
     return frame
 
 
-def cache_status():
+def cache_status(force=False):
+    now = time.monotonic()
+    with _STATUS_LOCK:
+        if not force and _STATUS_CACHE["data"] is not None and (now - _STATUS_CACHE["ts"]) < 10.0:
+            return dict(_STATUS_CACHE["data"])
     _init_cache()
-    with sqlite3.connect(CACHE_DB) as conn:
+    with sqlite3.connect(CACHE_DB, timeout=30) as conn:
         stocks, rows, earliest, newest = conn.execute(
             "SELECT COUNT(DISTINCT code), COUNT(*), MIN(date), MAX(date) FROM daily"
         ).fetchone()
         named = conn.execute("SELECT COUNT(*) FROM stock_names").fetchone()[0]
     size_mb = CACHE_DB.stat().st_size / (1024 * 1024) if CACHE_DB.exists() else 0.0
-    return {
+    data = {
         "stocks": stocks or 0,
         "rows": rows or 0,
         "earliest": earliest,
@@ -477,6 +502,31 @@ def cache_status():
         "named": named or 0,
         "size_mb": size_mb,
     }
+    with _STATUS_LOCK:
+        _STATUS_CACHE["ts"] = now
+        _STATUS_CACHE["data"] = data
+    return dict(data)
+
+
+def watchlist_load():
+    _init_cache()
+    with sqlite3.connect(CACHE_DB, timeout=30) as conn:
+        return conn.execute("SELECT code, name, added_at FROM watchlist ORDER BY added_at DESC, code").fetchall()
+
+
+def watchlist_add(code, name):
+    _init_cache()
+    with sqlite3.connect(CACHE_DB, timeout=30) as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO watchlist(code, name, added_at) VALUES (?, ?, ?)",
+            (code, name, datetime.now().strftime("%Y-%m-%d %H:%M")),
+        )
+
+
+def watchlist_remove(code):
+    _init_cache()
+    with sqlite3.connect(CACHE_DB, timeout=30) as conn:
+        conn.execute("DELETE FROM watchlist WHERE code=?", (code,))
 
 
 def cache_universe_save(stocks):
@@ -486,6 +536,7 @@ def cache_universe_save(stocks):
         conn.executemany("INSERT OR REPLACE INTO stock_names(code,name) VALUES (?,?)",
                          stocks[["code", "code_name"]].itertuples(index=False, name=None))
     _setting_set("stock_list_updated_date", date.today().strftime("%Y-%m-%d"))
+    _invalidate_status_cache()
 
 
 def cache_universe_load():
@@ -880,7 +931,7 @@ class AutoSyncManager:
             for k, v in kwargs.items():
                 setattr(self, f"_{k}", v)
 
-    def should_run_today(self, now=None):
+    def should_run_today(self, now=None, local_status=None):
         now = now or datetime.now()
         cfg = get_auto_sync_config()
         if not cfg["enabled"]:
@@ -890,7 +941,7 @@ class AutoSyncManager:
         today_str = now.strftime("%Y-%m-%d")
         if cfg["last_date"] == today_str:
             return False, "今日已自动更新"
-        local = cache_status()
+        local = local_status if local_status is not None else cache_status()
         if local["newest"] and local["newest"] >= today_str:
             return False, "今日行情已是最新"
         if now.strftime("%H:%M") < cfg["sync_time"]:
@@ -974,9 +1025,9 @@ class AutoSyncManager:
             self._set_state(running=False)
             SYNC_LOCK.release()
 
-    def snapshot(self):
+    def snapshot(self, local_status=None):
         cfg = get_auto_sync_config()
-        _, today_status = self.should_run_today()
+        _, today_status = self.should_run_today(local_status=local_status)
         with self._state_lock:
             return {
                 "enabled": cfg["enabled"],
@@ -1052,27 +1103,17 @@ def _load_market_arrays_cached(start, end, db_rows, db_newest):
     return market
 
 
-def load_cache(codes, start, end, on_progress=None):
-    _init_cache()
-    if on_progress:
-        on_progress(0.06, stage=1, detail=f"正在从 SQLite 读取 {len(codes):,} 只标的的区间行情（{start} ~ {end}）…")
-    with sqlite3.connect(CACHE_DB) as conn:
-        conn.execute("CREATE TEMP TABLE wanted (code TEXT PRIMARY KEY)")
-        conn.executemany("INSERT OR IGNORE INTO wanted VALUES (?)", ((code,) for code, _ in codes))
-        frame = pd.read_sql_query(
-            "SELECT d.date,d.code,d.open,d.high,d.low,d.close,d.volume,d.amount,d.turn,d.pctChg,d.isST "
-            "FROM daily d JOIN wanted w ON d.code=w.code WHERE d.date BETWEEN ? AND ? ORDER BY d.code,d.date",
-            conn, params=(start, end),
-        )
-    if frame.empty:
-        return {}
-    if on_progress:
-        on_progress(0.16, stage=1, detail=f"已读取 {len(frame):,} 条日线记录，正在按标的构建内存索引…")
-    frame["date"] = pd.to_datetime(frame["date"])
-    grouped = {code: group.reset_index(drop=True) for code, group in frame.groupby("code", sort=False)}
-    if on_progress:
-        on_progress(0.22, stage=2, detail=f"已载入 {len(grouped):,} 只标的行情，开始计算技术指标与策略匹配…")
-    return grouped
+def _limit_pct_threshold(code):
+    """按板块返回涨跌停幅度阈值：双创 20cm(19.5%)、北交所 30cm(29.5%)、主板 10cm(9.5%)。"""
+    if code.startswith(("sh.688", "sh.689", "sz.300", "sz.301")):
+        return 19.5
+    if code.startswith("bj."):
+        return 29.5
+    return 9.5
+
+
+def _is_gem_or_star(code):
+    return code.startswith(("sh.688", "sh.689", "sz.300", "sz.301"))
 
 
 def _rolling_mean_1d(arr, window):
@@ -1195,7 +1236,7 @@ def _fast_indicators_np(o, h, l, c, v, amt, pct):
     )
 
 
-def _eval_strategies_np(feat, strategies):
+def _eval_strategies_np(feat, strategies, limit_pct=9.5):
     """按需只计算用户勾选的策略（排除 RPS），避免无效分支开销。"""
     o, h, l, c, v, amt, pct, ma5, ma10, ma20, ma25, ma60, rsi, macd, sig, k_arr, d_arr, vol_ma5, vol_ma20 = feat
     matched = []
@@ -1203,6 +1244,8 @@ def _eval_strategies_np(feat, strategies):
     cross_macd = None
     cross_kdj = None
     recent_limit = None
+    lim_up_ratio = 1.0 + limit_pct / 100.0
+    lim_dn_ratio = 1.0 - limit_pct / 100.0
 
     for name in strategies:
         ok = False
@@ -1211,12 +1254,12 @@ def _eval_strategies_np(feat, strategies):
         elif name == "涨停回马枪策略":
             if recent_limit is None:
                 ret = np.nan_to_num(pct, nan=0.0)
-                recent_limit = bool((ret[-11:-1] >= 9.5).any())
+                recent_limit = bool((ret[-11:-1] >= limit_pct).any())
             ok = recent_limit and c[-1] > o[-1] and c[-1] > ma5[-1] and v[-1] < vol_ma20[-1]
         elif name == "涨停横盘策略":
             if recent_limit is None:
                 ret = np.nan_to_num(pct, nan=0.0)
-                recent_limit = bool((ret[-11:-1] >= 9.5).any())
+                recent_limit = bool((ret[-11:-1] >= limit_pct).any())
             ok = (
                 recent_limit
                 and len(c) >= 6
@@ -1229,7 +1272,7 @@ def _eval_strategies_np(feat, strategies):
                 and abs(c[-2] - o[-2]) < (o[-3] - c[-3]) * 0.5
                 and c[-1] > (o[-3] + c[-3]) / 2.0
             )
-        elif name in ("多金叉共振", "金三角策略"):
+        elif name == "多金叉共振":
             if cross_ma is None:
                 cross_ma = bool(ma5[-2] <= ma10[-2] and ma5[-1] > ma10[-1])
             if cross_macd is None:
@@ -1237,6 +1280,14 @@ def _eval_strategies_np(feat, strategies):
             if cross_kdj is None:
                 cross_kdj = bool(k_arr[-2] <= d_arr[-2] and k_arr[-1] > d_arr[-1])
             ok = cross_ma and cross_macd and cross_kdj
+        elif name == "金三角策略":
+            # 均线价托初成：MA5>MA10>MA20 当日成型（前一日尚未完成多头排列）且放量收阳
+            ok = (
+                ma5[-1] > ma10[-1] > ma20[-1]
+                and (ma5[-2] <= ma10[-2] or ma10[-2] <= ma20[-2])
+                and c[-1] > o[-1]
+                and v[-1] > vol_ma5[-1]
+            )
         elif name == "多方炮策略":
             ok = c[-3] > o[-3] and c[-2] < o[-2] and c[-1] > o[-1] and c[-1] > c[-3]
         elif name == "阻力位突破策略":
@@ -1284,9 +1335,9 @@ def _eval_strategies_np(feat, strategies):
                 and v[-1] < np.nanmean(v[-21:-1]) * 0.6
             )
         elif name == "涨停洗盘策略":
-            ok = c[-2] >= c[-3] * 1.095 and c[-1] < o[-1] and v[-1] > v[-2] * 2 and l[-1] >= c[-2]
+            ok = c[-2] >= c[-3] * lim_up_ratio and c[-1] < o[-1] and v[-1] > v[-2] * 2 and l[-1] >= c[-2]
         elif name == "上升趋势跌停反包":
-            ok = ma20[-2] > ma60[-2] and c[-1] <= c[-2] * 0.905 and v[-1] > vol_ma20[-1] * 2
+            ok = ma20[-2] > ma60[-2] and c[-1] <= c[-2] * lim_dn_ratio and v[-1] > vol_ma20[-1] * 2
 
         if bool(ok):
             matched.append((name, STRATEGIES[name]))
@@ -1314,72 +1365,19 @@ def indicators(frame):
     return d.dropna(subset=["ma25", "rsi", "macd", "signal", "k", "d"])
 
 
-def strategy_signal(frame, name, d=None):
-    d = d if d is not None else indicators(frame)
-    if len(d) < 3:
-        return False, "数据不足"
-    x, p, p2 = d.iloc[-1], d.iloc[-2], d.iloc[-3]
-    if name == "底部趋势拐点":
-        matched = x.rsi < 38 and x.close > x.open and x.macd > p.macd and x.volume > x.vol_ma5
-    elif name == "涨停回马枪策略":
-        recent_limit = (d.pctChg.fillna(0).iloc[-11:-1] >= 9.5).any()
-        matched = recent_limit and x.close > x.open and x.close > x.ma5 and x.volume < x.vol_ma20
-    elif name == "涨停横盘策略":
-        recent_limit = (d.pctChg.fillna(0).iloc[-11:-1] >= 9.5).any()
-        matched = recent_limit and d.close.iloc[-5:].std() / x.close < .04 and x.close > d.high.iloc[-6:-1].max()
-    elif name == "启明星策略":
-        matched = p2.close < p2.open and abs(p.close - p.open) < (p2.open - p2.close) * .5 and x.close > (p2.open + p2.close) / 2
-    elif name in ("多金叉共振", "金三角策略"):
-        cross_ma = p.ma5 <= p.ma10 and x.ma5 > x.ma10
-        cross_macd = p.macd <= p.signal and x.macd > x.signal
-        cross_kdj = p.k <= p.d and x.k > x.d
-        matched = cross_ma and cross_macd and cross_kdj
-    elif name == "多方炮策略":
-        matched = p2.close > p2.open and p.close < p.open and x.close > x.open and x.close > p2.close
-    elif name == "阻力位突破策略":
-        matched = x.close > d.high.iloc[-21:-1].max() and x.volume > x.vol_ma20 * 1.5
-    elif name == "强势洗盘弱转强":
-        matched = x.close > x.open and x.close > p.high and p.close < p.open and x.ma5 > x.ma20
-    elif name == "趋势加速拐点":
-        matched = x.ma5 > p.ma5 > p2.ma5 and x.pctChg > 3 and x.volume > x.vol_ma20 * 1.3
-    elif name == "仙人指路策略":
-        matched = (x.high - max(x.open, x.close)) > abs(x.close - x.open) * 1.8 and x.close > x.ma20
-    elif name == "W底策略":
-        matched = abs(d.low.iloc[-10:-5].min() - d.low.iloc[-5:-1].min()) / x.close < .04 and x.close > d.high.iloc[-10:-1].max()
-    elif name == "趋势起点策略":
-        cross_ma = p.ma5 <= p.ma10 and x.ma5 > x.ma10
-        matched = cross_ma and x.ma20 > p.ma20
-    elif name == "2560战法":
-        matched = x.close > x.ma25 and x.volume > x.vol_ma5 > x.vol_ma20
-    elif name == "金叉不绿策略":
-        cross_ma = p.ma5 <= p.ma10 and x.ma5 > x.ma10
-        matched = cross_ma and x.close >= x.open
-    elif name == "海龟突破策略":
-        matched = x.close > d.high.iloc[-21:-1].max() and x.amount > 100_000_000 and x.close > x.open and x.close > p.close
-    elif name == "高旗形整理策略":
-        matched = (
-            d.high.iloc[-40:].max() / d.low.iloc[-40:].min() > 1.6
-            and d.high.iloc[-10:].max() / d.low.iloc[-10:].min() < 1.15
-            and d.low.iloc[-10:].min() >= d.high.iloc[-40:].max() * .8
-            and x.volume < d.volume.iloc[-21:-1].mean() * .6
-        )
-    elif name == "涨停洗盘策略":
-        matched = p.close >= p2.close * 1.095 and x.close < x.open and x.volume > p.volume * 2 and x.low >= p.close
-    elif name == "上升趋势跌停反包":
-        matched = p.ma20 > p.ma60 and x.close <= p.close * .905 and x.volume > x.vol_ma20 * 2
-    else:
-        matched = False
-    return bool(matched), STRATEGIES.get(name, "")
-
-
-def screen(codes, frames, strategies, min_change, min_turn, max_turn, on_progress=None, window_start=None):
+def screen(
+    codes, frames, strategies, min_change, min_turn, max_turn,
+    on_progress=None, window_start=None,
+    exclude_st=True, exclude_gem_star=False, min_amount=0.0,
+):
     rows = []
     sparks = {}
-    stats = {"ready": 0, "missing": 0, "short": 0}
+    stats = {"ready": 0, "missing": 0, "short": 0, "filtered": 0}
     fallback_progress = None if on_progress else st.progress(0, text="正在读取本地行情…")
     window_start_str = pd.Timestamp(window_start).strftime("%Y-%m-%d") if window_start is not None else None
     non_rps = [s for s in strategies if s != "RPS强势突破"]
     need_rps = "RPS强势突破" in strategies
+    min_amt_yuan = float(min_amount) * 1e8 if min_amount and min_amount > 0 else 0.0
 
     def _emit(ratio, stage, detail, hits=0, scanned=0, total=0):
         if on_progress:
@@ -1392,11 +1390,26 @@ def screen(codes, frames, strategies, min_change, min_turn, max_turn, on_progres
             tail = close_arr[-20:]
             sparks[code] = [round(float(v), 2) for v in tail if not np.isnan(v)]
 
+    def _append_row(strategy, code, name, last_close, last_pct, last_turn, last_amt, reason):
+        rows.append({
+            "策略": strategy, "代码": code, "名称": name,
+            "收盘": last_close, "涨跌幅%": last_pct,
+            "换手率%": last_turn if not np.isnan(last_turn) else float("nan"),
+            "成交额(亿)": round(last_amt / 1e8, 2) if not np.isnan(last_amt) else float("nan"),
+            "信号说明": reason,
+        })
+
     def run():
         rps_pool = {}
         total_codes = max(1, len(codes))
         last_tick = 0.0
         for i, (code, name) in enumerate(codes, 1):
+            if exclude_st and "ST" in str(name).upper():
+                stats["filtered"] += 1
+                continue
+            if exclude_gem_star and _is_gem_or_star(code):
+                stats["filtered"] += 1
+                continue
             item = frames.get(code)
             if item is None:
                 stats["missing"] += 1
@@ -1423,21 +1436,19 @@ def screen(codes, frames, strategies, min_change, min_turn, max_turn, on_progres
                         last_close = float(c[-1])
                         last_turn = float(t[-1])
                         last_pct = float(pct[-1])
+                        last_amt = float(amt[-1])
                         if need_rps and len(c) >= 121:
-                            rps_pool[code] = (name, c, h, last_close, last_turn, last_pct)
+                            rps_pool[code] = (name, c, h, last_close, last_turn, last_pct, last_amt)
                         turn_ok = np.isnan(last_turn) or (min_turn <= last_turn <= max_turn)
                         pct_ok = (not np.isnan(last_pct)) and (last_pct >= min_change)
-                        if non_rps and pct_ok and turn_ok:
+                        amt_ok = (min_amt_yuan <= 0.0) or ((not np.isnan(last_amt)) and last_amt >= min_amt_yuan)
+                        if non_rps and pct_ok and turn_ok and amt_ok:
                             feat = _fast_indicators_np(o, h, l, c, v, amt, pct)
                             if feat is not None:
-                                for strategy, reason in _eval_strategies_np(feat, non_rps):
+                                lim = _limit_pct_threshold(code)
+                                for strategy, reason in _eval_strategies_np(feat, non_rps, limit_pct=lim):
                                     _record_spark(code, c)
-                                    rows.append({
-                                        "策略": strategy, "代码": code, "名称": name,
-                                        "收盘": last_close, "涨跌幅%": last_pct,
-                                        "换手率%": last_turn if not np.isnan(last_turn) else float("nan"),
-                                        "信号说明": reason,
-                                    })
+                                    _append_row(strategy, code, name, last_close, last_pct, last_turn, last_amt, reason)
             else:
                 dates, o, h, l, c, v, amt, t, pct = item
                 n_bars = len(c)
@@ -1452,21 +1463,19 @@ def screen(codes, frames, strategies, min_change, min_turn, max_turn, on_progres
                     last_close = float(c[-1])
                     last_turn = float(t[-1])
                     last_pct = float(pct[-1])
+                    last_amt = float(amt[-1])
                     if need_rps and n_bars >= 121:
-                        rps_pool[code] = (name, c, h, last_close, last_turn, last_pct)
+                        rps_pool[code] = (name, c, h, last_close, last_turn, last_pct, last_amt)
                     turn_ok = np.isnan(last_turn) or (min_turn <= last_turn <= max_turn)
                     pct_ok = (not np.isnan(last_pct)) and (last_pct >= min_change)
-                    if non_rps and pct_ok and turn_ok:
+                    amt_ok = (min_amt_yuan <= 0.0) or ((not np.isnan(last_amt)) and last_amt >= min_amt_yuan)
+                    if non_rps and pct_ok and turn_ok and amt_ok:
                         feat = _fast_indicators_np(o, h, l, c, v, amt, pct)
                         if feat is not None:
-                            for strategy, reason in _eval_strategies_np(feat, non_rps):
+                            lim = _limit_pct_threshold(code)
+                            for strategy, reason in _eval_strategies_np(feat, non_rps, limit_pct=lim):
                                 _record_spark(code, c)
-                                rows.append({
-                                    "策略": strategy, "代码": code, "名称": name,
-                                    "收盘": last_close, "涨跌幅%": last_pct,
-                                    "换手率%": last_turn if not np.isnan(last_turn) else float("nan"),
-                                    "信号说明": reason,
-                                })
+                                _append_row(strategy, code, name, last_close, last_pct, last_turn, last_amt, reason)
 
             now = time.monotonic()
             if i == total_codes or i % 500 == 0 or (now - last_tick) >= 0.25:
@@ -1487,18 +1496,17 @@ def screen(codes, frames, strategies, min_change, min_turn, max_turn, on_progres
             returns = pd.Series({code: vals[1][-1] / vals[1][-121] - 1.0 for code, vals in rps_pool.items()})
             ranks = returns.rank(pct=True) * 100.0
             for code, rank in ranks.items():
-                name, c, h, last_close, last_turn, last_pct = rps_pool[code]
+                name, c, h, last_close, last_turn, last_pct, last_amt = rps_pool[code]
                 breakout = last_close >= float(np.nanmax(h[-120:])) * 0.9
                 turn_ok = np.isnan(last_turn) or (min_turn <= last_turn <= max_turn)
                 pct_ok = (not np.isnan(last_pct)) and (last_pct >= min_change)
-                if rank >= 90 and breakout and pct_ok and turn_ok:
+                amt_ok = (min_amt_yuan <= 0.0) or ((not np.isnan(last_amt)) and last_amt >= min_amt_yuan)
+                if rank >= 90 and breakout and pct_ok and turn_ok and amt_ok:
                     _record_spark(code, c)
-                    rows.append({
-                        "策略": "RPS强势突破", "代码": code, "名称": name,
-                        "收盘": last_close, "涨跌幅%": last_pct,
-                        "换手率%": last_turn if not np.isnan(last_turn) else float("nan"),
-                        "信号说明": f"本次扫描样本 RPS {rank:.1f}，收盘处于 120 日高点 90% 内",
-                    })
+                    _append_row(
+                        "RPS强势突破", code, name, last_close, last_pct, last_turn, last_amt,
+                        f"本次扫描样本 RPS {rank:.1f}，收盘处于 120 日高点 90% 内",
+                    )
 
         _emit(0.99, stage=3, detail="正在排序信号榜并生成迷你走势数据…",
               hits=len(rows), scanned=total_codes, total=total_codes)
@@ -1509,6 +1517,58 @@ def screen(codes, frames, strategies, min_change, min_turn, max_turn, on_progres
         fallback_progress.empty()
     stats["sparks"] = sparks
     return result, stats
+
+
+def compute_forward_returns(result_df, signal_end_str):
+    """若本地 SQLite 存在 signal_end_str 之后的交易日，快速统计各策略后续 5 日 / 10 日收益与胜率。"""
+    if result_df is None or result_df.empty:
+        return pd.DataFrame()
+    codes = result_df["代码"].unique().tolist()
+    _init_cache()
+    with sqlite3.connect(CACHE_DB, timeout=30) as conn:
+        conn.execute("CREATE TEMP TABLE fwd_codes (code TEXT PRIMARY KEY)")
+        conn.executemany("INSERT OR IGNORE INTO fwd_codes VALUES (?)", ((c,) for c in codes))
+        rows = conn.execute(
+            "SELECT d.code, d.date, d.close FROM daily d "
+            "JOIN fwd_codes f ON d.code = f.code "
+            "WHERE d.date > ? AND d.close IS NOT NULL ORDER BY d.code, d.date",
+            (signal_end_str,),
+        ).fetchall()
+    if not rows:
+        return pd.DataFrame()
+
+    future_closes = {}
+    for code, _dt, cl in rows:
+        future_closes.setdefault(code, []).append(float(cl))
+
+    # 以信号当日收盘价为基准计算 T+5 / T+10 涨跌幅
+    base_close = dict(result_df[["代码", "收盘"]].drop_duplicates("代码").itertuples(index=False, name=None))
+    ret5_map, ret10_map = {}, {}
+    for code, closes in future_closes.items():
+        base = base_close.get(code)
+        if not base or base <= 0:
+            continue
+        if len(closes) >= 5:
+            ret5_map[code] = (closes[4] / base - 1.0) * 100.0
+        if len(closes) >= 10:
+            ret10_map[code] = (closes[9] / base - 1.0) * 100.0
+    if not ret5_map and not ret10_map:
+        return pd.DataFrame()
+
+    summary = []
+    for strat, grp in result_df.groupby("策略", sort=False):
+        c_list = grp["代码"].unique().tolist()
+        r5 = [ret5_map[c] for c in c_list if c in ret5_map]
+        r10 = [ret10_map[c] for c in c_list if c in ret10_map]
+        summary.append({
+            "策略": strat,
+            "样本数": len(c_list),
+            "5日胜率%": round(sum(1 for v in r5 if v > 0) / len(r5) * 100.0, 1) if r5 else float("nan"),
+            "5日均涨幅%": round(float(np.mean(r5)), 2) if r5 else float("nan"),
+            "10日胜率%": round(sum(1 for v in r10 if v > 0) / len(r10) * 100.0, 1) if r10 else float("nan"),
+            "10日均涨幅%": round(float(np.mean(r10)), 2) if r10 else float("nan"),
+        })
+    return pd.DataFrame(summary)
 
 
 def push_wechat(result, sendkey, strategy_names):
@@ -2556,7 +2616,10 @@ def _run_update_action(start, end):
         st.success(f"行情缓存已更新：{summary_text}（通道：{update_stats.get('source', '自动')}）。")
 
 
-def _run_screen_action(start, end, strategies, min_change, min_turn, max_turn, max_stocks):
+def _run_screen_action(
+    start, end, strategies, min_change, min_turn, max_turn, max_stocks,
+    exclude_st=True, exclude_gem_star=False, min_amount=0.0,
+):
     tracker = FloatingProgress(
         f"正在执行本地策略选股（{len(strategies)} 套策略）",
         ("读取 SQLite 缓存", "技术指标与策略匹配", "生成信号与走势"),
@@ -2587,6 +2650,7 @@ def _run_screen_action(start, end, strategies, min_change, min_turn, max_turn, m
         result, scan_stats = screen(
             selected, frames, strategies, min_change, min_turn, max_turn,
             on_progress=tracker.update, window_start=start,
+            exclude_st=exclude_st, exclude_gem_star=exclude_gem_star, min_amount=min_amount,
         )
         sparks = scan_stats.pop("sparks", {})
         tracker.update(
@@ -2694,13 +2758,21 @@ with st.sidebar:
 
     sac.divider(label="行情过滤", icon="funnel", align="start", size="xs", color="gray")
     min_change = st.number_input("最低涨跌幅 (%)", -10.0, 20.0, 0.0, 0.5, format="%.1f")
-    min_turn, max_turn = st.slider("换手率范围 (%)", 0.0, 100.0, (0.0, 100.0), step=0.5)
+    min_turn = 0.0
+    max_turn = st.slider("最高换手率 (%)", 0.0, 100.0, 100.0, step=0.5, help="左侧固定 0%，拖动滑块限制最大换手率（100% 表示不限）")
+    min_amount = st.number_input("最低日成交额 (亿元)", 0.0, 100.0, 0.0, 0.5, format="%.1f", help="设为 0 表示不限制；建议设 1.0 亿以上过滤僵尸股")
+    f_c1, f_c2 = st.columns(2)
+    with f_c1:
+        exclude_st = st.checkbox("排除 ST", value=True, help="过滤名称含 ST / *ST 的风险警示标的")
+    with f_c2:
+        exclude_gem_star = st.checkbox("排除双创", value=False, help="过滤创业板(300/301)与科创板(688/689)")
     max_stocks = st.number_input("最多扫描股票数 (只)", 10, 6000, 6000, 200)
 
     sac.divider(label="执行操作", icon="lightning-charge", align="start", size="xs", color="gray")
     run_btn = st.button("开始本地选股", type="primary", use_container_width=True, icon=":material/radar:")
     update_btn = st.button("更新全市场行情缓存", use_container_width=True, icon=":material/cloud_sync:")
 
+    local_status = cache_status()
     sync_mgr = get_auto_sync_manager()
     auto_cfg = get_auto_sync_config()
     auto_toggle = st.toggle(
@@ -2713,13 +2785,11 @@ with st.sidebar:
         save_auto_sync_config(auto_toggle, auto_cfg["sync_time"])
         st.rerun()
 
-    auto_state = sync_mgr.snapshot()
+    auto_state = sync_mgr.snapshot(local_status=local_status)
     st.caption(f"自动更新状态：{auto_state['today_status']} · 日常选股全程离线读取 SQLite。")
 
 
 # ========================== Main Header & Navigation ==========================
-local_status = cache_status()
-auto_state = sync_mgr.snapshot()
 _render_hero(local_status, strategies, auto_sync=auto_state)
 
 if auto_state["running"]:
@@ -2740,18 +2810,26 @@ elif not strategies:
 
 if update_btn and valid_params:
     _run_update_action(start, end)
-    local_status = cache_status()
+    local_status = cache_status(force=True)
+    auto_state = sync_mgr.snapshot(local_status=local_status)
 
 should_scan = run_btn or st.session_state.pop("trigger_scan", False)
 if should_scan and valid_params:
-    _run_screen_action(start, end, strategies, min_change, min_turn, max_turn, max_stocks)
+    _run_screen_action(
+        start, end, strategies, min_change, min_turn, max_turn, max_stocks,
+        exclude_st=exclude_st, exclude_gem_star=exclude_gem_star, min_amount=min_amount,
+    )
 
 result = st.session_state.get("result")
 hit_badge = sac.Tag(f"{len(result)}", color="red", bordered=False) if result is not None and not result.empty else None
+watchlist_rows = watchlist_load()
+watchlist_codes = {r[0] for r in watchlist_rows}
+wl_badge = sac.Tag(f"{len(watchlist_rows)}", color="gold", bordered=False) if watchlist_rows else None
 
 active_tab = sac.tabs(
     items=[
         sac.TabsItem(label="策略选股工作台", icon="graph-up-arrow", tag=hit_badge),
+        sac.TabsItem(label="自选观察池", icon="star", tag=wl_badge),
         sac.TabsItem(label="策略百科矩阵", icon="grid-1x2", tag=sac.Tag("20", color="blue", bordered=False)),
         sac.TabsItem(label="数据源与缓存中心", icon="database-check"),
     ],
@@ -2831,7 +2909,7 @@ if active_tab == "策略选股工作台":
         """, unsafe_allow_html=True)
 
         hit_strategies = list(result["策略"].unique())
-        bar_c1, bar_c2, bar_c3 = st.columns([2.4, 1.2, 0.9], vertical_alignment="bottom")
+        bar_c1, bar_c2, bar_c3, bar_c4 = st.columns([2.1, 1.1, 1.0, 0.8], vertical_alignment="bottom")
         with bar_c1:
             if len(hit_strategies) > 1:
                 filter_strategy = sac.chip(
@@ -2847,8 +2925,21 @@ if active_tab == "策略选股工作台":
                 filter_strategy = "全部策略"
                 sac.tags([sac.Tag(hit_strategies[0], color="red", bordered=False)], size="sm")
         with bar_c2:
-            keyword = st.text_input("快速搜索", placeholder="输入代码或名称过滤…", label_visibility="collapsed")
+            view_mode = sac.segmented(
+                items=[
+                    sac.SegmentedItem(label="按信号展开"),
+                    sac.SegmentedItem(label="按股票聚合"),
+                ],
+                index=0,
+                size="xs",
+                radius="md",
+                color="red",
+                use_container_width=True,
+                key="signal_view_mode",
+            )
         with bar_c3:
+            keyword = st.text_input("快速搜索", placeholder="输入代码或名称过滤…", label_visibility="collapsed")
+        with bar_c4:
             st.download_button(
                 "导出 CSV",
                 data=result.to_csv(index=False).encode("utf-8-sig"),
@@ -2873,8 +2964,50 @@ if active_tab == "策略选股工作台":
             sac.alert(label="过滤后暂无匹配标的", description="请清空搜索关键词或切换策略标签。", color="info", icon=True)
         else:
             sparks = st.session_state.get("sparks", {})
-            display_df = filtered.copy()
-            display_df.insert(5, "近20日走势", display_df["代码"].map(lambda c: sparks.get(c, [])))
+            if view_mode == "按股票聚合":
+                agg_rows = []
+                for code, grp in filtered.groupby("代码", sort=False):
+                    first = grp.iloc[0]
+                    strats = grp["策略"].unique().tolist()
+                    agg_rows.append({
+                        "代码": code,
+                        "名称": first["名称"],
+                        "命中数": len(strats),
+                        "命中策略": " · ".join(strats),
+                        "收盘": first["收盘"],
+                        "涨跌幅%": first["涨跌幅%"],
+                        "近20日走势": sparks.get(code, []),
+                        "换手率%": first["换手率%"],
+                        "成交额(亿)": first["成交额(亿)"] if "成交额(亿)" in first else float("nan"),
+                    })
+                display_df = pd.DataFrame(agg_rows).sort_values(
+                    ["命中数", "涨跌幅%"], ascending=[False, False]
+                ).reset_index(drop=True)
+                col_cfg = {
+                    "代码": st.column_config.TextColumn("代码", width="small"),
+                    "名称": st.column_config.TextColumn("股票名称", width="small"),
+                    "命中数": st.column_config.NumberColumn("共振数", format="%d", width="small"),
+                    "命中策略": st.column_config.TextColumn("命中策略组合", width="large"),
+                    "收盘": st.column_config.NumberColumn("收盘价", format="¥%.2f", width="small"),
+                    "涨跌幅%": st.column_config.NumberColumn("涨跌幅", format="%+.2f%%", width="small"),
+                    "近20日走势": st.column_config.LineChartColumn("近20日走势", width="medium"),
+                    "换手率%": st.column_config.ProgressColumn("换手率", format="%.2f%%", min_value=0, max_value=25, width="small"),
+                    "成交额(亿)": st.column_config.NumberColumn("成交额", format="%.2f亿", width="small"),
+                }
+            else:
+                display_df = filtered.copy()
+                display_df.insert(5, "近20日走势", display_df["代码"].map(lambda c: sparks.get(c, [])))
+                col_cfg = {
+                    "策略": st.column_config.TextColumn("命中策略", width="medium"),
+                    "代码": st.column_config.TextColumn("代码", width="small"),
+                    "名称": st.column_config.TextColumn("股票名称", width="small"),
+                    "收盘": st.column_config.NumberColumn("收盘价", format="¥%.2f", width="small"),
+                    "涨跌幅%": st.column_config.NumberColumn("涨跌幅", format="%+.2f%%", width="small"),
+                    "近20日走势": st.column_config.LineChartColumn("近20日走势", width="medium"),
+                    "换手率%": st.column_config.ProgressColumn("换手率", format="%.2f%%", min_value=0, max_value=25, width="small"),
+                    "成交额(亿)": st.column_config.NumberColumn("成交额", format="%.2f亿", width="small"),
+                    "信号说明": st.column_config.TextColumn("触发逻辑", width="large"),
+                }
 
             styled_df = display_df.style.map(_style_pct, subset=["涨跌幅%"])
             table_event = st.dataframe(
@@ -2884,28 +3017,43 @@ if active_tab == "策略选股工作台":
                 height=340,
                 on_select="rerun",
                 selection_mode="single-row",
-                key="signal_table",
-                column_config={
-                    "策略": st.column_config.TextColumn("命中策略", width="medium"),
-                    "代码": st.column_config.TextColumn("代码", width="small"),
-                    "名称": st.column_config.TextColumn("股票名称", width="small"),
-                    "收盘": st.column_config.NumberColumn("收盘价", format="¥%.2f", width="small"),
-                    "涨跌幅%": st.column_config.NumberColumn("涨跌幅", format="%+.2f%%", width="small"),
-                    "近20日走势": st.column_config.LineChartColumn("近20日走势", width="medium"),
-                    "换手率%": st.column_config.ProgressColumn("换手率", format="%.2f%%", min_value=0, max_value=25, width="small"),
-                    "信号说明": st.column_config.TextColumn("触发逻辑", width="large"),
-                },
+                key=f"signal_table_{view_mode}",
+                column_config=col_cfg,
             )
 
+            # ---- Optional Historical Forward-Return Quick Check ----
+            scan_end_dt = st.session_state.get("range", (start, end))[1]
+            scan_end_str = scan_end_dt.strftime("%Y-%m-%d")
+            newest_db_str = str(local_status.get("newest") or "")
+            if newest_db_str and scan_end_str < newest_db_str:
+                fwd_df = compute_forward_returns(filtered, scan_end_str)
+                with st.expander(f"📊 历史胜率速验（信号日 {scan_end_str} 后 5 / 10 个交易日表现）", expanded=not fwd_df.empty):
+                    if fwd_df.empty:
+                        st.caption("信号日之后的本地交易日不足 5 天，暂无法统计后续收益。")
+                    else:
+                        st.dataframe(
+                            fwd_df,
+                            use_container_width=True,
+                            hide_index=True,
+                            column_config={
+                                "5日胜率%": st.column_config.NumberColumn("5日胜率", format="%.1f%%"),
+                                "5日均涨幅%": st.column_config.NumberColumn("5日均涨幅", format="%+.2f%%"),
+                                "10日胜率%": st.column_config.NumberColumn("10日胜率", format="%.1f%%"),
+                                "10日均涨幅%": st.column_config.NumberColumn("10日均涨幅", format="%+.2f%%"),
+                            },
+                        )
+            else:
+                st.caption("💡 提示：将左侧「结束日期」调至历史某交易日后重新选股，可在此自动统计命中标的后续 5 日 / 10 日胜率与平均收益。")
+
             # ---- Section B: Stock Technical Analysis Terminal ----
-            stocks_df = filtered[["代码", "名称"]].drop_duplicates("代码")
+            stocks_df = display_df[["代码", "名称"]].drop_duplicates("代码")
             name_by_code = dict(stocks_df.itertuples(index=False, name=None))
             stock_codes = list(name_by_code.keys())
 
             # Row click selection takes precedence when changed
             selected_rows = table_event.selection.rows if table_event and hasattr(table_event, "selection") else []
-            if selected_rows:
-                clicked_code = filtered.iloc[selected_rows[0]]["代码"]
+            if selected_rows and selected_rows[0] < len(display_df):
+                clicked_code = display_df.iloc[selected_rows[0]]["代码"]
                 if clicked_code != st.session_state.get("last_clicked_code"):
                     st.session_state["last_clicked_code"] = clicked_code
                     st.session_state["active_stock"] = clicked_code
@@ -2922,7 +3070,7 @@ if active_tab == "策略选股工作台":
             </div>
             """, unsafe_allow_html=True)
 
-            nav1, nav2, nav3, nav4 = st.columns([2.6, 0.55, 0.55, 2.2], vertical_alignment="bottom")
+            nav1, nav2, nav3, nav_wl, nav4 = st.columns([2.2, 0.55, 0.55, 0.85, 2.0], vertical_alignment="bottom")
             with nav1:
                 choice = st.selectbox(
                     "选择分析标的",
@@ -2941,6 +3089,17 @@ if active_tab == "策略选股工作台":
             with nav3:
                 if st.button("下一只", use_container_width=True, disabled=current_idx >= len(stock_codes) - 1):
                     st.session_state["active_stock"] = stock_codes[current_idx + 1]
+                    st.rerun()
+            with nav_wl:
+                cur_code = st.session_state["active_stock"]
+                in_wl = cur_code in watchlist_codes
+                if st.button("★ 已自选" if in_wl else "☆ 加自选", use_container_width=True, key=f"wl_toggle_{cur_code}"):
+                    if in_wl:
+                        watchlist_remove(cur_code)
+                        st.toast(f"已移出自选：{name_by_code[cur_code]} ({cur_code})")
+                    else:
+                        watchlist_add(cur_code, name_by_code[cur_code])
+                        st.toast(f"已加入自选：{name_by_code[cur_code]} ({cur_code})", icon="⭐")
                     st.rerun()
             with nav4:
                 interval = sac.segmented(
@@ -3062,7 +3221,121 @@ if active_tab == "策略选股工作台":
                 )
 
 
-# ========================== Tab 2: 策略百科矩阵 ==========================
+# ========================== Tab 2: 自选观察池 ==========================
+elif active_tab == "自选观察池":
+    st.markdown("""
+    <div class="sec-head">
+        <div class="sec-title"><span class="sec-dot"></span>本地自选股观察池</div>
+        <div class="sec-meta">持久化保存在本地 stock_cache.sqlite3，点击表格行可联动下方 K 线图复盘</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    if not watchlist_rows:
+        sac.alert(
+            label="自选观察池为空",
+            description="在「策略选股工作台」选中任意个股后，点击「☆ 加自选」即可加入此处跟踪复盘。",
+            color="info",
+            icon=True,
+        )
+    else:
+        wl_codes_list = [r[0] for r in watchlist_rows]
+        _init_cache()
+        with sqlite3.connect(CACHE_DB, timeout=30) as conn:
+            conn.execute("CREATE TEMP TABLE wl_tmp (code TEXT PRIMARY KEY)")
+            conn.executemany("INSERT OR IGNORE INTO wl_tmp VALUES (?)", ((c,) for c in wl_codes_list))
+            latest_map = {
+                row[0]: row[1:]
+                for row in conn.execute(
+                    """
+                    WITH mx AS (
+                        SELECT w.code, MAX(d.date) AS last_d
+                        FROM wl_tmp w LEFT JOIN daily d ON d.code = w.code
+                        GROUP BY w.code
+                    )
+                    SELECT m.code, d.date, d.close, d.pctChg, d.turn, d.amount
+                    FROM mx m LEFT JOIN daily d ON d.code = m.code AND d.date = m.last_d
+                    """
+                )
+            }
+        wl_data = []
+        for code, name, added_at in watchlist_rows:
+            dt_s, cl, pct, trn, amt = latest_map.get(code, (None, None, None, None, None))
+            wl_data.append({
+                "代码": code,
+                "名称": name,
+                "最新日期": dt_s or "—",
+                "收盘": float(cl) if cl is not None else float("nan"),
+                "涨跌幅%": float(pct) if pct is not None else float("nan"),
+                "换手率%": float(trn) if trn is not None else float("nan"),
+                "成交额(亿)": round(float(amt) / 1e8, 2) if amt is not None else float("nan"),
+                "加入时间": added_at,
+            })
+        wl_df = pd.DataFrame(wl_data)
+        wl_event = st.dataframe(
+            wl_df.style.map(_style_pct, subset=["涨跌幅%"]),
+            use_container_width=True,
+            hide_index=True,
+            height=280,
+            on_select="rerun",
+            selection_mode="single-row",
+            key="watchlist_table",
+            column_config={
+                "收盘": st.column_config.NumberColumn("最新收盘", format="¥%.2f"),
+                "涨跌幅%": st.column_config.NumberColumn("涨跌幅", format="%+.2f%%"),
+                "换手率%": st.column_config.NumberColumn("换手率", format="%.2f%%"),
+                "成交额(亿)": st.column_config.NumberColumn("成交额", format="%.2f亿"),
+            },
+        )
+        wl_sel = wl_event.selection.rows if wl_event and hasattr(wl_event, "selection") else []
+        if wl_sel and wl_sel[0] < len(wl_df):
+            st.session_state["wl_active_stock"] = wl_df.iloc[wl_sel[0]]["代码"]
+        wl_name_map = {r[0]: r[1] for r in watchlist_rows}
+        if st.session_state.get("wl_active_stock") not in wl_name_map:
+            st.session_state["wl_active_stock"] = wl_codes_list[0]
+
+        wc1, wc2, wc3 = st.columns([2.2, 0.9, 1.9], vertical_alignment="bottom")
+        with wc1:
+            wl_choice = st.selectbox(
+                "选择自选标的",
+                options=wl_codes_list,
+                index=wl_codes_list.index(st.session_state["wl_active_stock"]),
+                format_func=lambda c: f"{wl_name_map[c]} ({c})",
+                label_visibility="collapsed",
+                key="wl_stock_select",
+            )
+            st.session_state["wl_active_stock"] = wl_choice
+        with wc2:
+            if st.button("移出自选", use_container_width=True, key="wl_remove_btn"):
+                watchlist_remove(wl_choice)
+                st.toast(f"已移出自选：{wl_name_map[wl_choice]} ({wl_choice})")
+                st.rerun()
+        with wc3:
+            wl_interval = sac.segmented(
+                items=[
+                    sac.SegmentedItem(label="日线", icon="bar-chart-line"),
+                    sac.SegmentedItem(label="周线", icon="calendar-week"),
+                    sac.SegmentedItem(label="月线", icon="calendar-month"),
+                ],
+                index=0,
+                size="sm",
+                radius="md",
+                color="red",
+                use_container_width=True,
+                key="wl_interval_seg",
+            )
+        wl_frame = _cache_read(wl_choice, (start - timedelta(days=150)).strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"))
+        if not wl_frame.empty:
+            wl_panes, _ = chart_panes(wl_frame, f"{wl_name_map[wl_choice]} · {wl_choice}", wl_interval, show_ma=True, show_macd=True, display_start=start)
+            lightweight_charts_v5_component(
+                name=f"wl {wl_name_map[wl_choice]} {wl_choice}",
+                charts=wl_panes,
+                height=640,
+                zoom_level=85,
+                key=f"wl_chart_{wl_choice}_{wl_interval}",
+            )
+
+
+# ========================== Tab 3: 策略百科矩阵 ==========================
 elif active_tab == "策略百科矩阵":
     st.markdown("""
     <div class="sec-head">

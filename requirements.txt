@@ -1,4 +1,5 @@
 baostock>=0.9.4
+numpy>=1.24
 pandas>=2.0
 streamlit-lightweight-charts-v5>=0.2.0
 streamlit-antd-components>=0.3.2
