@@ -2381,6 +2381,149 @@ html, body, [class*="css"] {
     justify-content: center;
     gap: 8px;
 }
+
+/* Tablet & Mobile Responsive Adaptations */
+@media (max-width: 768px) {
+    [data-testid="stMainBlockContainer"] {
+        padding-left: 0.9rem;
+        padding-right: 0.9rem;
+        padding-top: 0.9rem;
+    }
+    .hero-bar {
+        padding: 14px 16px;
+        gap: 10px;
+    }
+    .ticker-stats {
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+    }
+}
+
+@media (max-width: 640px) {
+    [data-testid="stMainBlockContainer"] {
+        padding: 0.7rem 0.65rem 2.4rem 0.65rem;
+    }
+    [data-testid="stSidebar"] {
+        max-width: 86vw;
+    }
+    .hero-bar {
+        padding: 12px 14px;
+        border-radius: 13px;
+        margin-bottom: 10px;
+    }
+    .hero-left {
+        gap: 10px;
+        align-items: flex-start;
+    }
+    .hero-logo {
+        width: 36px;
+        height: 36px;
+        border-radius: 10px;
+    }
+    .hero-title {
+        font-size: 1.05rem;
+        line-height: 1.28;
+    }
+    .hero-sub {
+        font-size: 0.74rem;
+    }
+    .hero-right {
+        width: 100%;
+        justify-content: flex-start;
+        gap: 6px;
+    }
+    .status-pill {
+        font-size: 0.72rem;
+        padding: 4px 9px;
+    }
+    .kpi-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 8px;
+        margin-bottom: 10px;
+    }
+    .kpi-card {
+        padding: 11px 12px;
+        border-radius: 12px;
+    }
+    .kpi-label {
+        font-size: 0.72rem;
+    }
+    .kpi-value {
+        font-size: 1.22rem;
+    }
+    .kpi-sub {
+        font-size: 0.7rem;
+    }
+    .sec-head {
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 4px;
+        margin: 12px 0 8px 0;
+    }
+    .sec-title {
+        font-size: 0.94rem;
+    }
+    .sec-meta {
+        font-size: 0.73rem;
+    }
+    .ticker-card {
+        padding: 12px 14px;
+        border-radius: 13px;
+    }
+    .ticker-top {
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 8px;
+    }
+    .ticker-name {
+        font-size: 1.08rem;
+    }
+    .ticker-price {
+        font-size: 1.38rem;
+    }
+    .ticker-stats {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 8px;
+    }
+    .t-stat {
+        padding: 7px 9px;
+    }
+    .ma-legend {
+        gap: 8px;
+        padding: 6px 10px;
+        font-size: 0.73rem;
+    }
+    .scan-float-card {
+        width: 94vw;
+        padding: 16px 16px;
+        border-radius: 14px;
+    }
+    .scan-title {
+        font-size: 0.95rem;
+    }
+    .scan-pct {
+        font-size: 1.24rem;
+    }
+    .scan-steps {
+        grid-template-columns: 1fr;
+        gap: 6px;
+    }
+    .scan-step {
+        text-align: left;
+        padding: 6px 10px;
+    }
+    .empty-hero {
+        padding: 22px 16px 18px 16px;
+    }
+    .empty-title {
+        font-size: 1.06rem;
+    }
+    .empty-desc {
+        font-size: 0.8rem;
+    }
+    .stButton > button {
+        min-height: 38px;
+    }
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -2766,6 +2909,7 @@ with st.sidebar:
         exclude_st = st.checkbox("排除 ST", value=True, help="过滤名称含 ST / *ST 的风险警示标的")
     with f_c2:
         exclude_gem_star = st.checkbox("排除双创", value=False, help="过滤创业板(300/301)与科创板(688/689)")
+    mobile_compact = st.toggle("手机紧凑视图", value=False, help="手机竖屏建议开启：精简信号榜列数免横滑，并调低 K 线图高度防误触")
     max_stocks = st.number_input("最多扫描股票数 (只)", 10, 6000, 6000, 200)
 
     sac.divider(label="执行操作", icon="lightning-charge", align="start", size="xs", color="gray")
@@ -3013,15 +3157,25 @@ if active_tab == "策略选股工作台":
                     "信号说明": st.column_config.TextColumn("触发逻辑", width="large"),
                 }
 
-            styled_df = display_df.style.map(_style_pct, subset=["涨跌幅%"])
+            if mobile_compact:
+                keep_cols = (
+                    ["代码", "名称", "命中数", "收盘", "涨跌幅%"]
+                    if view_mode == "按股票聚合"
+                    else ["代码", "名称", "收盘", "涨跌幅%", "策略"]
+                )
+                table_df = display_df[[c for c in keep_cols if c in display_df.columns]]
+            else:
+                table_df = display_df
+
+            styled_df = table_df.style.map(_style_pct, subset=["涨跌幅%"])
             table_event = st.dataframe(
                 styled_df,
                 use_container_width=True,
                 hide_index=True,
-                height=340,
+                height=280 if mobile_compact else 340,
                 on_select="rerun",
                 selection_mode="single-row",
-                key=f"signal_table_{view_mode}",
+                key=f"signal_table_{view_mode}_{mobile_compact}",
                 column_config=col_cfg,
             )
 
@@ -3215,13 +3369,13 @@ if active_tab == "策略选股工作台":
                 if legend_parts:
                     st.markdown(f'<div class="ma-legend">{"".join(legend_parts)}</div>', unsafe_allow_html=True)
 
-                chart_height = 705 if show_macd else 565
+                chart_height = (460 if show_macd else 360) if mobile_compact else (705 if show_macd else 565)
                 lightweight_charts_v5_component(
                     name=f"{name_by_code[choice]} {choice}",
                     charts=panes,
                     height=chart_height,
-                    zoom_level=85,
-                    key=f"chart_{choice}_{interval}_{show_ma}_{show_macd}",
+                    zoom_level=65 if mobile_compact else 85,
+                    key=f"chart_{choice}_{interval}_{show_ma}_{show_macd}_{mobile_compact}",
                 )
 
 
@@ -3333,9 +3487,9 @@ elif active_tab == "自选观察池":
             lightweight_charts_v5_component(
                 name=f"wl {wl_name_map[wl_choice]} {wl_choice}",
                 charts=wl_panes,
-                height=640,
-                zoom_level=85,
-                key=f"wl_chart_{wl_choice}_{wl_interval}",
+                height=440 if mobile_compact else 640,
+                zoom_level=65 if mobile_compact else 85,
+                key=f"wl_chart_{wl_choice}_{wl_interval}_{mobile_compact}",
             )
 
 
