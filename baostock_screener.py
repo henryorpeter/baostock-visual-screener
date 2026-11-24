@@ -2912,8 +2912,11 @@ if active_tab == "策略选股工作台":
         bar_c1, bar_c2, bar_c3, bar_c4 = st.columns([2.1, 1.1, 1.0, 0.8], vertical_alignment="bottom")
         with bar_c1:
             if len(hit_strategies) > 1:
+                chip_items = ["全部策略"] + hit_strategies
+                if st.session_state.get("result_strategy_chip") not in chip_items:
+                    st.session_state["result_strategy_chip"] = "全部策略"
                 filter_strategy = sac.chip(
-                    items=["全部策略"] + hit_strategies,
+                    items=chip_items,
                     index=0,
                     size="sm",
                     radius="md",
@@ -2922,6 +2925,7 @@ if active_tab == "策略选股工作台":
                     key="result_strategy_chip",
                 )
             else:
+                st.session_state.pop("result_strategy_chip", None)
                 filter_strategy = "全部策略"
                 sac.tags([sac.Tag(hit_strategies[0], color="red", bordered=False)], size="sm")
         with bar_c2:
