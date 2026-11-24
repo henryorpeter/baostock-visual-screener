@@ -23,7 +23,7 @@
 
 ---
 
-基于 **Streamlit + Ant Design (`streamlit-antd-components`) + TradingView Lightweight Charts** 构建的 A 股本地化可视化选股终端。支持全市场历史日线本地 SQLite 缓存、20 套经典技术形态策略实时扫描、交互式信号榜与专业多周期 K 线看盘。
+基于 **Streamlit + Ant Design (`streamlit-antd-components`) + TradingView Lightweight Charts** 构建的 A 股市场的量化选股系统终端。支持全市场历史日线本地 SQLite 缓存、20 套经典技术形态策略实时扫描、交互式信号榜与专业多周期 K 线看盘。
 
 > **免责声明**：本工具仅供技术形态研究与复盘学习参考，所有筛选信号与历史胜率统计均不构成任何投资建议。
 
