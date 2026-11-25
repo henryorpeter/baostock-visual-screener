@@ -1266,7 +1266,8 @@
         borderColor: p.border,
         timeVisible: false,
         fixLeftEdge: true,
-        rightOffset: 6,
+        fixRightEdge: true,
+        rightOffset: 2,
         barSpacing: bars.length > 150 ? 6 : 9,
       },
       localization: {
