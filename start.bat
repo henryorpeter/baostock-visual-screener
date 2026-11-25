@@ -1,10 +1,14 @@
 @echo off
 chcp 65001 >nul
-title KLineRadar A股技术形态选股终端
+title KLineRadar A股选股与看盘终端 (Port 8506)
 cd /d "%~dp0"
+set PORT=8506
+for /f "tokens=5" %%a in ('netstat -aon ^| findstr ":%PORT% " ^| findstr "LISTENING"') do (
+    if not "%%a"=="0" taskkill /F /PID %%a >nul 2>&1
+)
 echo ====================================================
-echo  正在启动 KLineRadar A股技术形态选股终端...
-echo  访问地址: http://localhost:8501
+echo  正在启动 KLineRadar A股选股与看盘终端...
+echo  本机访问: http://localhost:%PORT%
 echo ====================================================
-".venv\Scripts\streamlit.exe" run baostock_screener.py
+".venv\Scripts\streamlit.exe" run app.py --server.port %PORT% --server.address 0.0.0.0
 pause
