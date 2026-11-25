@@ -189,8 +189,8 @@ def _render_stock_terminal(
         unsafe_allow_html=True,
     )
 
-    # OKX/交易所风格指标工具行：主图叠加（MA/EMA/BOLL）+ 副图指标（VOL/MACD/KDJ/RSI）
-    ic1, ic2 = st.columns([1.0, 1.35], vertical_alignment="center")
+    # OKX/交易所风格指标工具行：主图叠加（MA/EMA/BOLL/BBI/SAR/KC）+ 副图指标（VOL/MACD/KDJ/RSI/WR/CCI/OBV/ATR）
+    ic1, ic2 = st.columns([1.05, 1.45], vertical_alignment="center")
     with ic1:
         overlays = st.pills(
             "主图指标",
@@ -229,9 +229,15 @@ def _render_stock_terminal(
         for s, col in ((12, "#22d3ee"), (26, "#a78bfa"), (60, "#f59e0b")):
             parts.append(f'<span style="color:{col};">EMA{s} {_fv(f"ema{s}")}</span>')
     if "BOLL" in overlays:
-        parts.append(f'<span style="color:#f59e0b;">UP {_fv("boll_up")}</span>')
+        parts.append(f'<span style="color:#f59e0b;">BOLL UP {_fv("boll_up")}</span>')
         parts.append(f'<span style="color:#d4d8e2;">MID {_fv("boll_mid")}</span>')
         parts.append(f'<span style="color:#a855f7;">DN {_fv("boll_dn")}</span>')
+    if "BBI" in overlays:
+        parts.append(f'<span style="color:#2dd4bf;">BBI {_fv("bbi")}</span>')
+    if "SAR" in overlays:
+        parts.append(f'<span style="color:#fbbf24;">SAR {_fv("sar")}</span>')
+    if "KC" in overlays:
+        parts.append(f'<span style="color:#38bdf8;">KC UP {_fv("kc_up")} / DN {_fv("kc_dn")}</span>')
     if "MACD" in sub_panes:
         parts.append(f'<span style="color:#f0b90b;">DIF {_fv("dif", ".3f")}</span>')
         parts.append(f'<span style="color:#e879f9;">DEA {_fv("dea", ".3f")}</span>')
@@ -244,6 +250,15 @@ def _render_stock_terminal(
         parts.append(f'<span style="color:#f0b90b;">RSI6 {_fv("rsi6", ".1f")}</span>')
         parts.append(f'<span style="color:#38bdf8;">RSI12 {_fv("rsi12", ".1f")}</span>')
         parts.append(f'<span style="color:#e879f9;">RSI24 {_fv("rsi24", ".1f")}</span>')
+    if "WR" in sub_panes:
+        parts.append(f'<span style="color:#f0b90b;">WR10 {_fv("wr10", ".1f")}</span>')
+        parts.append(f'<span style="color:#38bdf8;">WR6 {_fv("wr6", ".1f")}</span>')
+    if "CCI" in sub_panes:
+        parts.append(f'<span style="color:#38bdf8;">CCI {_fv("cci", ".1f")}</span>')
+    if "OBV" in sub_panes:
+        parts.append(f'<span style="color:#f0b90b;">OBV {charts._fmt_volume(last_k.get("obv"))}</span>')
+    if "ATR" in sub_panes:
+        parts.append(f'<span style="color:#fb923c;">ATR14 {_fv("atr14", ".3f")}</span>')
     if parts:
         st.markdown(f'<div class="ma-bar">{"".join(parts)}</div>', unsafe_allow_html=True)
 

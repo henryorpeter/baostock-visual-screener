@@ -2,12 +2,54 @@
 from html import escape
 import time
 
+import numpy as np
 import pandas as pd
 import streamlit as st
 
 
-MAIN_OVERLAYS = ("MA", "EMA", "BOLL")
-SUB_INDICATORS = ("VOL", "MACD", "KDJ", "RSI")
+MAIN_OVERLAYS = ("MA", "EMA", "BOLL", "BBI", "SAR", "KC")
+SUB_INDICATORS = ("VOL", "MACD", "KDJ", "RSI", "WR", "CCI", "OBV", "ATR")
+
+
+def _sar_series(high, low, step=0.02, max_af=0.20):
+    """标准 Wilder 抛物线转向指标 (Parabolic SAR)。"""
+    h = high.to_numpy(dtype=np.float64)
+    l = low.to_numpy(dtype=np.float64)
+    n = len(h)
+    if n < 2:
+        return np.full(n, np.nan)
+    sar = np.full(n, np.nan, dtype=np.float64)
+    bull = h[1] >= h[0]
+    af = step
+    ep = h[0] if bull else l[0]
+    sar[0] = l[0] if bull else h[0]
+    for i in range(1, n):
+        prev_sar = sar[i - 1]
+        cur = prev_sar + af * (ep - prev_sar)
+        if bull:
+            cur = min(cur, l[i - 1], l[i - 2] if i >= 2 else l[i - 1])
+            if l[i] < cur:
+                bull = False
+                cur = ep
+                ep = l[i]
+                af = step
+            else:
+                if h[i] > ep:
+                    ep = h[i]
+                    af = min(max_af, af + step)
+        else:
+            cur = max(cur, h[i - 1], h[i - 2] if i >= 2 else h[i - 1])
+            if h[i] > cur:
+                bull = True
+                cur = ep
+                ep = h[i]
+                af = step
+            else:
+                if l[i] < ep:
+                    ep = l[i]
+                    af = min(max_af, af + step)
+        sar[i] = cur
+    return sar
 
 
 def _kdj_series(high, low, close, n=9):
@@ -59,19 +101,30 @@ def _resample_kline(frame, interval):
             date=("date", "last"), open=("open", "first"), high=("high", "max"),
             low=("low", "min"), close=("close", "last"), volume=("volume", "sum"),
         ).reset_index(drop=True)
-    # 主图均线 MA / EMA / BOLL
-    for window in (5, 10, 20, 30):
+    # 主图均线 MA / EMA / BOLL / BBI / SAR / KC
+    for window in (3, 5, 6, 10, 12, 20, 24, 30):
         d[f"ma{window}"] = d.close.rolling(window).mean()
-    for span in (12, 26, 60):
+    for span in (12, 20, 26, 60):
         d[f"ema{span}"] = d.close.ewm(span=span, adjust=False).mean()
-    boll_mid = d.close.rolling(20).mean()
+    boll_mid = d["ma20"]
     boll_std = d.close.rolling(20).std(ddof=0)
     d["boll_mid"] = boll_mid
     d["boll_up"] = boll_mid + 2.0 * boll_std
     d["boll_dn"] = boll_mid - 2.0 * boll_std
-    # 成交量均量
+    d["bbi"] = (d["ma3"] + d["ma6"] + d["ma12"] + d["ma24"]) / 4.0
+    d["sar"] = _sar_series(d.high, d.low)
+    prev_c = d.close.shift(1)
+    tr = pd.concat([(d.high - d.low), (d.high - prev_c).abs(), (d.low - prev_c).abs()], axis=1).max(axis=1)
+    d["atr10"] = tr.ewm(alpha=1.0 / 10.0, min_periods=10, adjust=False).mean()
+    d["atr14"] = tr.ewm(alpha=1.0 / 14.0, min_periods=14, adjust=False).mean()
+    d["kc_mid"] = d["ema20"]
+    d["kc_up"] = d["ema20"] + 2.0 * d["atr10"]
+    d["kc_dn"] = d["ema20"] - 2.0 * d["atr10"]
+    # 成交量均量 & OBV
     d["vol_ma5"] = d.volume.rolling(5).mean()
     d["vol_ma10"] = d.volume.rolling(10).mean()
+    d["obv"] = (np.sign(d.close.diff().fillna(0.0)) * d.volume).cumsum()
+    d["obv_ma30"] = d["obv"].rolling(30).mean()
     # MACD (12, 26, 9)
     d["dif"] = d["ema12"] - d["ema26"]
     d["dea"] = d["dif"].ewm(span=9, adjust=False).mean()
@@ -81,6 +134,16 @@ def _resample_kline(frame, interval):
     # RSI (6, 12, 24)
     for w in (6, 12, 24):
         d[f"rsi{w}"] = _rsi_series(d.close, w)
+    # WR (10, 6) 威廉指标（0~100 刻度，A股看盘惯例）
+    for w in (10, 6):
+        hh = d.high.rolling(w).max()
+        ll = d.low.rolling(w).min()
+        d[f"wr{w}"] = 100.0 * (hh - d.close) / (hh - ll).replace(0, float("nan"))
+    # CCI (14) 顺势指标
+    tp = (d.high + d.low + d.close) / 3.0
+    tp_ma = tp.rolling(14).mean()
+    tp_md = tp.rolling(14).apply(lambda arr: float(np.mean(np.abs(arr - np.mean(arr)))), raw=True)
+    d["cci"] = (tp - tp_ma) / (0.015 * tp_md.replace(0, float("nan")))
     d["time"] = pd.to_datetime(d.date).dt.strftime("%Y-%m-%d")
     return d
 
@@ -173,6 +236,19 @@ def chart_panes(
             s = _line_series(col, color, style=sty)
             if s:
                 price_series.append(s)
+    if "BBI" in active_overlays:
+        s = _line_series("bbi", "#2dd4bf", width=2)
+        if s:
+            price_series.append(s)
+    if "SAR" in active_overlays:
+        s = _line_series("sar", "#fbbf24", width=2, style=1)
+        if s:
+            price_series.append(s)
+    if "KC" in active_overlays:
+        for col, color, sty in (("kc_up", "#38bdf8", 2), ("kc_mid", "#94a3b8", 0), ("kc_dn", "#38bdf8", 2)):
+            s = _line_series(col, color, style=sty)
+            if s:
+                price_series.append(s)
 
     panes = [
         {"chart": theme, "height": 325, "title": f"{title} · {interval}", "series": price_series},
@@ -233,6 +309,36 @@ def chart_panes(
         ]
         if rsi_series:
             panes.append({"chart": theme, "height": 98, "title": "RSI(6,12,24)", "series": rsi_series})
+
+    if "WR" in active_subs:
+        wr_series = [
+            s for s in (
+                _line_series("wr10", "#f0b90b"),
+                _line_series("wr6", "#38bdf8"),
+            ) if s
+        ]
+        if wr_series:
+            panes.append({"chart": theme, "height": 96, "title": "WR(10,6)", "series": wr_series})
+
+    if "CCI" in active_subs:
+        cci_s = _line_series("cci", "#38bdf8")
+        if cci_s:
+            panes.append({"chart": theme, "height": 96, "title": "CCI(14)", "series": [cci_s]})
+
+    if "OBV" in active_subs:
+        obv_series = [
+            s for s in (
+                _line_series("obv", "#f0b90b"),
+                _line_series("obv_ma30", "#e879f9"),
+            ) if s
+        ]
+        if obv_series:
+            panes.append({"chart": theme, "height": 96, "title": "OBV(30)", "series": obv_series})
+
+    if "ATR" in active_subs:
+        atr_s = _line_series("atr14", "#fb923c")
+        if atr_s:
+            panes.append({"chart": theme, "height": 96, "title": "ATR(14)", "series": [atr_s]})
 
     return panes, d
 
