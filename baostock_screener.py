@@ -334,6 +334,11 @@ def _tencent_stock_list():
             fields = content.split("~")
             if len(fields) < 4 or not fields[1] or fields[1] == "N/A":
                 continue
+            # 腾讯快照第 40 位为交易所状态位：'D'=已退市，'S'=临时停牌，''=正常交易；仅剔除退市股，保留停牌股
+            if len(fields) > 40 and fields[40].strip() == "D":
+                continue
+            if len(fields) > 48 and fields[47] == "-1" and fields[48] == "-1":
+                continue
             try:
                 if float(fields[3]) <= 0:
                     continue
@@ -503,6 +508,94 @@ def _history_eastmoney(code, start, end, name=""):
         })
     cols = ["date", "code", "open", "high", "low", "close", "volume", "amount", "turn", "pctChg", "isST"]
     frame = pd.DataFrame(parsed, columns=cols)
+    if not frame.empty:
+        frame["date"] = pd.to_datetime(frame["date"])
+        frame = frame.dropna(subset=["close"]).sort_values("date")
+    return frame
+
+
+def _history_sina(code, start, end, name=""):
+    """新浪财经前复权日线备用源（独立于东财/腾讯，成交量单位为股，叠加 qfq.js 前复权因子）。"""
+    market, symbol = code.split(".")
+    sym = f"{market}{symbol}"
+    days = min(1023, max(120, (pd.Timestamp(end) - pd.Timestamp(start)).days + 45))
+    session = _http_session()
+    resp = session.get(
+        f"https://quotes.sina.cn/cn/api/jsonp_v2.php/var%20_{sym}=/CN_MarketDataService.getKLineData",
+        params={"symbol": sym, "scale": "240", "ma": "no", "datalen": str(days)},
+        headers={"Referer": "https://finance.sina.com.cn/"},
+        timeout=12,
+    )
+    resp.raise_for_status()
+    m = re.search(r"\((\[.*\])\)", resp.text, re.S)
+    if not m:
+        raise RuntimeError(f"新浪日线接口未返回 {code} 数据")
+    bars = json.loads(m.group(1))
+    if not bars:
+        raise RuntimeError(f"新浪日线返回空列表: {code}")
+
+    # 拉取前复权因子（按日期降序，价格 / 对应区间因子 = 前复权价）
+    qfq_factors = []
+    try:
+        qf_resp = session.get(
+            f"https://finance.sina.com.cn/realstock/company/{sym}/qfq.js",
+            headers={"Referer": "https://finance.sina.com.cn/"},
+            timeout=8,
+        )
+        if qf_resp.status_code == 200:
+            qm = re.search(r"(\{.*\})", qf_resp.text, re.S)
+            if qm:
+                raw_data = json.loads(qm.group(1)).get("data") or []
+                for item in raw_data:
+                    d_s, f_s = item.get("d"), item.get("f")
+                    if d_s and f_s:
+                        fv = float(f_s)
+                        if fv > 0:
+                            qfq_factors.append((str(d_s), fv))
+                qfq_factors.sort(key=lambda x: x[0], reverse=True)
+    except Exception:
+        qfq_factors = []
+
+    def _factor_for(d_str):
+        for fd, fv in qfq_factors:
+            if d_str >= fd:
+                return fv
+        return qfq_factors[-1][1] if qfq_factors else 1.0
+
+    parsed = []
+    is_st = "1" if "ST" in (name or "").upper() else "0"
+    for bar in bars:
+        d_str = str(bar.get("day", ""))[:10]
+        if not d_str:
+            continue
+        try:
+            op = float(bar["open"])
+            hi = float(bar["high"])
+            lo = float(bar["low"])
+            cl = float(bar["close"])
+            vol = float(bar["volume"])
+        except (KeyError, ValueError, TypeError):
+            continue
+        fac = _factor_for(d_str)
+        if fac != 1.0:
+            op, hi, lo, cl = op / fac, hi / fac, lo / fac, cl / fac
+        parsed.append({
+            "date": d_str,
+            "code": code,
+            "open": round(op, 4),
+            "high": round(hi, 4),
+            "low": round(lo, 4),
+            "close": round(cl, 4),
+            "volume": vol,
+            "amount": cl * vol,
+            "turn": float("nan"),
+            "isST": is_st,
+        })
+    if not parsed:
+        raise RuntimeError(f"新浪日线解析为空: {code}")
+    frame = pd.DataFrame(parsed).sort_values("date")
+    frame["pctChg"] = frame["close"].pct_change().mul(100.0)
+    frame = frame[(frame["date"] >= start) & (frame["date"] <= end)].copy()
     if not frame.empty:
         frame["date"] = pd.to_datetime(frame["date"])
         frame = frame.dropna(subset=["close"]).sort_values("date")
@@ -714,6 +807,8 @@ def _fetch_tencent_snapshots(codes, progress=None, progress_range=(0.05, 0.55)):
             amount = amt_wan * 10000.0
             name = parts[1].strip()
             code = f"{symbol[:2]}.{symbol_num}"
+            status_flag = parts[40].strip() if len(parts) > 40 else ""
+            is_delisted = (status_flag == "D") or (len(parts) > 48 and parts[47] == "-1" and parts[48] == "-1")
             parsed[code] = {
                 "date": f"{ts[:4]}-{ts[4:6]}-{ts[6:8]}",
                 "code": code,
@@ -728,6 +823,8 @@ def _fetch_tencent_snapshots(codes, progress=None, progress_range=(0.05, 0.55)):
                 "turn": turn,
                 "pctChg": pct_chg,
                 "isST": "1" if "ST" in name.upper() else "0",
+                "status": status_flag,
+                "is_delisted": is_delisted,
             }
         return parsed
 
@@ -774,9 +871,10 @@ def update_cache(codes, start, end, progress):
                     LEFT JOIN daily d ON d.code = w.code
                     GROUP BY w.code
                 )
-                SELECT a.code, a.first_d, a.last_d, d.close, d.turn
+                SELECT a.code, a.first_d, a.last_d, d.close, d.turn, m.start_date, m.through_date
                 FROM agg a
                 LEFT JOIN daily d ON d.code = a.code AND d.date = a.last_d
+                LEFT JOIN sync_meta m ON m.code = a.code
                 """
             )
         }
@@ -786,18 +884,23 @@ def update_cache(codes, start, end, progress):
     backfill_tasks = []
     turn_patch_codes = []
     for code, name in codes:
-        first, last, last_close, last_turn = state.get(code, (None, None, None, None))
-        if first and last and first <= start and last >= effective_end:
-            if last_turn is None:
+        first, last, last_close, last_turn, synced_start, synced_through = state.get(
+            code, (None, None, None, None, None, None)
+        )
+        # 新股上市日期可能晚于 start、停牌股最后交易日可能早于 effective_end，借助 sync_meta 避免反复回补
+        start_covered = bool((first and first <= start) or (synced_start and synced_start <= start))
+        end_covered = bool((last and last >= effective_end) or (synced_through and synced_through >= effective_end))
+        if start_covered and end_covered:
+            if last == effective_end and last_turn is None:
                 turn_patch_codes.append((code, name))
             else:
                 skipped += 1
             continue
-        if first and first <= start and prev_trade_day and last == prev_trade_day:
+        if start_covered and prev_trade_day and last == prev_trade_day:
             snapshot_candidates.append((code, name, last_close))
         else:
             fetch_start = start
-            if first and first <= start and last:
+            if start_covered and last:
                 fetch_start = max(start, (pd.Timestamp(last) - pd.Timedelta(days=7)).strftime("%Y-%m-%d"))
             backfill_tasks.append((code, name, fetch_start))
 
@@ -854,11 +957,24 @@ def update_cache(codes, start, end, progress):
             for code, name, _ in snapshot_candidates:
                 backfill_tasks.append((code, name, recent_start))
 
-    # 2. 连接池并发历史回补：东方财富前复权（含换手率/成交额）-> 腾讯 fqkline 回退，每 100 只批量写库
+    # 清理本地股票池里历史遗留的已退市僵尸股（仅检查无日线或严重滞后标的，1~2 次批量请求即可完成）
+    no_data_tasks = [(code, name) for code, name, _ in backfill_tasks if state.get(code, (None, None, None, None))[1] is None]
+    if no_data_tasks:
+        probe_snaps = _fetch_tencent_snapshots(no_data_tasks, progress=None)
+        delisted_codes = {c for c, _ in no_data_tasks if (probe_snaps.get(c) or {}).get("is_delisted")}
+        if delisted_codes:
+            backfill_tasks = [t for t in backfill_tasks if t[0] not in delisted_codes]
+            skipped += len(delisted_codes)
+            with sqlite3.connect(CACHE_DB, timeout=30) as conn:
+                conn.executemany("DELETE FROM stock_names WHERE code=?", ((c,) for c in delisted_codes))
+            _invalidate_status_cache()
+
+    # 2. 连接池并发历史回补：东方财富 -> 腾讯 fqkline -> 新浪前复权 三级 HTTP 容灾，每 100 只批量写库
     if backfill_tasks:
         em_lock = threading.Lock()
         em_fail_streak = [0]
         tx_fail_streak = [0]
+        sn_fail_streak = [0]
         total_bf = len(backfill_tasks)
         base_p = snap_p_end if used_snapshot else 0.05
 
@@ -867,6 +983,7 @@ def update_cache(codes, start, end, progress):
             with em_lock:
                 skip_em = em_fail_streak[0] >= 12
                 skip_tx = tx_fail_streak[0] >= 12
+                skip_sn = sn_fail_streak[0] >= 12
             if not skip_em:
                 try:
                     frame = _history_eastmoney(code, fetch_start, effective_end, name=name)
@@ -876,16 +993,25 @@ def update_cache(codes, start, end, progress):
                 except Exception:
                     with em_lock:
                         em_fail_streak[0] += 1
-            if skip_tx:
-                raise RuntimeError("腾讯历史接口连续限流，已熔断跳过")
+            if not skip_tx:
+                try:
+                    frame = _history_http(code, fetch_start, effective_end, name=name)
+                    with em_lock:
+                        tx_fail_streak[0] = 0
+                    return frame
+                except Exception:
+                    with em_lock:
+                        tx_fail_streak[0] += 1
+            if skip_sn:
+                raise RuntimeError("东财/腾讯/新浪历史接口均已触发熔断")
             try:
-                frame = _history_http(code, fetch_start, effective_end, name=name)
+                frame = _history_sina(code, fetch_start, effective_end, name=name)
                 with em_lock:
-                    tx_fail_streak[0] = 0
+                    sn_fail_streak[0] = 0
                 return frame
             except Exception:
                 with em_lock:
-                    tx_fail_streak[0] += 1
+                    sn_fail_streak[0] += 1
                 raise
 
         batch_frames = []
@@ -1671,20 +1797,46 @@ def compute_forward_returns(result_df, signal_end_str):
     if not ret5_map and not ret10_map:
         return pd.DataFrame()
 
-    summary = []
-    for strat, grp in result_df.groupby("策略", sort=False):
-        c_list = grp["代码"].unique().tolist()
+    def _make_row(label, c_list):
         r5 = [ret5_map[c] for c in c_list if c in ret5_map]
         r10 = [ret10_map[c] for c in c_list if c in ret10_map]
-        summary.append({
-            "策略": strat,
+        return {
+            "策略": label,
             "样本数": len(c_list),
             "5日胜率%": round(sum(1 for v in r5 if v > 0) / len(r5) * 100.0, 1) if r5 else float("nan"),
             "5日均涨幅%": round(float(np.mean(r5)), 2) if r5 else float("nan"),
             "10日胜率%": round(sum(1 for v in r10 if v > 0) / len(r10) * 100.0, 1) if r10 else float("nan"),
             "10日均涨幅%": round(float(np.mean(r10)), 2) if r10 else float("nan"),
-        })
+        }
+
+    summary = []
+    for strat, grp in result_df.groupby("策略", sort=False):
+        summary.append(_make_row(strat, grp["代码"].unique().tolist()))
+
+    # 额外统计多策略共振（≥2 / ≥3）标的的表现，方便直接对比共振是否提升胜率
+    hit_counts = result_df.groupby("代码")["策略"].nunique()
+    for min_hits, label in ((2, "★ 多策略共振 (≥2)"), (3, "★ 强共振 (≥3)")):
+        res_codes = hit_counts[hit_counts >= min_hits].index.tolist()
+        if res_codes:
+            summary.append(_make_row(label, res_codes))
     return pd.DataFrame(summary)
+
+
+def _format_tdx_ebk(codes):
+    """导出通达信自定义板块 .ebk 格式：沪市 1+6位，深市 0+6位。"""
+    lines = []
+    for code in dict.fromkeys(codes):
+        if "." in code:
+            mkt, sym = code.split(".", 1)
+            prefix = "1" if mkt == "sh" else "0"
+            lines.append(f"{prefix}{sym}")
+    return ("\r\n".join(lines) + "\r\n").encode("ascii", errors="ignore")
+
+
+def _format_plain_codes(codes):
+    """导出纯 6 位股票代码（适配同花顺 / 东方财富自选股批量粘贴导入）。"""
+    syms = [code.split(".", 1)[1] if "." in code else code for code in dict.fromkeys(codes)]
+    return "\n".join(syms)
 
 
 def push_wechat(result, sendkey, strategy_names):
@@ -3169,7 +3321,7 @@ if active_tab == "策略选股工作台":
         """, unsafe_allow_html=True)
 
         hit_strategies = list(result["策略"].unique())
-        bar_c1, bar_c2, bar_c3, bar_c4 = st.columns([2.1, 1.1, 1.0, 0.8], vertical_alignment="bottom")
+        bar_c1, bar_c2, bar_c3, bar_c4 = st.columns([2.0, 1.1, 1.0, 0.9], vertical_alignment="bottom")
         with bar_c1:
             if len(hit_strategies) > 1:
                 chip_items = ["全部策略"] + hit_strategies
@@ -3204,14 +3356,32 @@ if active_tab == "策略选股工作台":
         with bar_c3:
             keyword = st.text_input("快速搜索", placeholder="输入代码或名称过滤…", label_visibility="collapsed")
         with bar_c4:
-            st.download_button(
-                "导出 CSV",
-                data=result.to_csv(index=False).encode("utf-8-sig"),
-                file_name=f"baostock_screen_{date.today():%Y%m%d}.csv",
-                mime="text/csv",
-                use_container_width=True,
-                icon=":material/download:",
-            )
+            export_codes = result["代码"].unique().tolist()
+            with st.popover("导出 / 导入", use_container_width=True, icon=":material/download:"):
+                st.download_button(
+                    "导出完整信号表 (.csv)",
+                    data=result.to_csv(index=False).encode("utf-8-sig"),
+                    file_name=f"klineradar_screen_{date.today():%Y%m%d}.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                )
+                st.download_button(
+                    "导出通达信板块 (.ebk)",
+                    data=_format_tdx_ebk(export_codes),
+                    file_name=f"klineradar_{date.today():%Y%m%d}.ebk",
+                    mime="application/octet-stream",
+                    use_container_width=True,
+                )
+                plain_txt = _format_plain_codes(export_codes)
+                st.download_button(
+                    "导出纯 6 位代码 (.txt)",
+                    data=plain_txt.encode("utf-8"),
+                    file_name=f"klineradar_codes_{date.today():%Y%m%d}.txt",
+                    mime="text/plain",
+                    use_container_width=True,
+                )
+                st.caption("纯 6 位代码（点击右上角一键复制，可直接粘贴进同花顺/东财自选股）：")
+                st.code(plain_txt, language="text")
 
         filtered = result.copy()
         if filter_strategy and filter_strategy != "全部策略":
@@ -3393,8 +3563,14 @@ if active_tab == "策略选股工作台":
 
             choice = st.session_state["active_stock"]
             start_date, end_date = st.session_state["range"]
-            chart_fetch_start = start_date - timedelta(days=150)
-            frame = _cache_read(choice, chart_fetch_start.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d"))
+            # 周线 / 月线直接读取本地全历史日线，避免 MA20/30 与 MACD 指标因区间过短留空
+            if interval in ("周线", "月线"):
+                chart_fetch_start_str = "1990-01-01"
+                chart_display_start = None
+            else:
+                chart_fetch_start_str = (start_date - timedelta(days=150)).strftime("%Y-%m-%d")
+                chart_display_start = start_date
+            frame = _cache_read(choice, chart_fetch_start_str, end_date.strftime("%Y-%m-%d"))
 
             if not frame.empty:
                 latest = frame.iloc[-1]
@@ -3455,7 +3631,7 @@ if active_tab == "策略选股工作台":
 
                 panes, kdf = chart_panes(
                     frame, f"{name_by_code[choice]} · {choice}", interval,
-                    show_ma=show_ma, show_macd=show_macd, display_start=start_date,
+                    show_ma=show_ma, show_macd=show_macd, display_start=chart_display_start,
                 )
                 last_k = kdf.iloc[-1]
                 legend_parts = []
@@ -3499,15 +3675,43 @@ if active_tab == "策略选股工作台":
 elif active_tab == "自选观察池":
     st.markdown("""
     <div class="sec-head">
-        <div class="sec-title"><span class="sec-dot"></span>本地自选股观察池</div>
-        <div class="sec-meta">持久化保存在本地 stock_cache.sqlite3，点击表格行可联动下方 K 线图复盘</div>
+        <div class="sec-title"><span class="sec-dot"></span>全市场快速查股 & 本地自选观察池</div>
+        <div class="sec-meta">无需选股也可直接输入代码/名称查看任意 A 股 K 线，并一键加入自选持久化跟踪</div>
     </div>
     """, unsafe_allow_html=True)
+
+    all_universe = cache_universe_load()
+    all_name_map = dict(all_universe)
+    all_codes_list = [c for c, _ in all_universe]
+
+    if all_codes_list:
+        q1, q2 = st.columns([3.4, 1.0], vertical_alignment="bottom")
+        with q1:
+            quick_pick = st.selectbox(
+                "快速查股（输入代码或名称搜索全市场 A 股）",
+                options=[""] + all_codes_list,
+                format_func=lambda c: "🔍 输入代码或股票名称快速看图（如 600519 / 茅台）…" if not c else f"{all_name_map[c]}  ({c})",
+                key="quick_lookup_select",
+            )
+        with q2:
+            if quick_pick:
+                q_in_wl = quick_pick in watchlist_codes
+                if st.button("★ 已在自选" if q_in_wl else "☆ 加入自选", use_container_width=True, key=f"ql_wl_btn_{quick_pick}"):
+                    if q_in_wl:
+                        watchlist_remove(quick_pick)
+                        st.toast(f"已移出自选：{all_name_map[quick_pick]} ({quick_pick})")
+                    else:
+                        watchlist_add(quick_pick, all_name_map[quick_pick])
+                        st.toast(f"已加入自选：{all_name_map[quick_pick]} ({quick_pick})", icon="⭐")
+                    st.rerun()
+        if quick_pick and quick_pick != st.session_state.get("last_quick_pick"):
+            st.session_state["last_quick_pick"] = quick_pick
+            st.session_state["wl_active_stock"] = quick_pick
 
     if not watchlist_rows:
         sac.alert(
             label="自选观察池为空",
-            description="在「策略选股工作台」选中任意个股后，点击「☆ 加自选」即可加入此处跟踪复盘。",
+            description="可在上方搜索框直接查股并点击「☆ 加入自选」，或在「策略选股工作台」选中任意个股加入自选。",
             color="info",
             icon=True,
         )
@@ -3549,7 +3753,7 @@ elif active_tab == "自选观察池":
             wl_df.style.map(_style_pct, subset=["涨跌幅%"]),
             use_container_width=True,
             hide_index=True,
-            height=280,
+            height=260,
             on_select="rerun",
             selection_mode="single-row",
             key="watchlist_table",
@@ -3562,27 +3766,31 @@ elif active_tab == "自选观察池":
         )
         wl_sel = wl_event.selection.rows if wl_event and hasattr(wl_event, "selection") else []
         if wl_sel and wl_sel[0] < len(wl_df):
-            st.session_state["wl_active_stock"] = wl_df.iloc[wl_sel[0]]["代码"]
-        wl_name_map = {r[0]: r[1] for r in watchlist_rows}
-        if st.session_state.get("wl_active_stock") not in wl_name_map:
-            st.session_state["wl_active_stock"] = wl_codes_list[0]
+            clicked_wl = wl_df.iloc[wl_sel[0]]["代码"]
+            if clicked_wl != st.session_state.get("last_wl_clicked"):
+                st.session_state["last_wl_clicked"] = clicked_wl
+                st.session_state["wl_active_stock"] = clicked_wl
 
+    # 统一渲染当前选中个股（来自快速搜股或自选表）的深度行情与多周期 K 线
+    wl_name_map = {**all_name_map, **{r[0]: r[1] for r in watchlist_rows}}
+    active_wl = st.session_state.get("wl_active_stock")
+    if active_wl not in wl_name_map:
+        active_wl = watchlist_rows[0][0] if watchlist_rows else ""
+    if active_wl:
         wc1, wc2, wc3 = st.columns([2.2, 0.9, 1.9], vertical_alignment="bottom")
         with wc1:
-            wl_choice = st.selectbox(
-                "选择自选标的",
-                options=wl_codes_list,
-                index=wl_codes_list.index(st.session_state["wl_active_stock"]),
-                format_func=lambda c: f"{wl_name_map[c]} ({c})",
-                label_visibility="collapsed",
-                key="wl_stock_select",
-            )
-            st.session_state["wl_active_stock"] = wl_choice
+            st.markdown(f"**当前看盘：{escape(wl_name_map[active_wl])}（`{escape(active_wl)}`）**")
         with wc2:
-            if st.button("移出自选", use_container_width=True, key="wl_remove_btn"):
-                watchlist_remove(wl_choice)
-                st.toast(f"已移出自选：{wl_name_map[wl_choice]} ({wl_choice})")
-                st.rerun()
+            if active_wl in watchlist_codes:
+                if st.button("移出自选", use_container_width=True, key=f"wl_remove_{active_wl}"):
+                    watchlist_remove(active_wl)
+                    st.toast(f"已移出自选：{wl_name_map[active_wl]} ({active_wl})")
+                    st.rerun()
+            else:
+                if st.button("☆ 加自选", use_container_width=True, key=f"wl_add_{active_wl}"):
+                    watchlist_add(active_wl, wl_name_map[active_wl])
+                    st.toast(f"已加入自选：{wl_name_map[active_wl]} ({active_wl})", icon="⭐")
+                    st.rerun()
         with wc3:
             wl_interval = sac.segmented(
                 items=[
@@ -3597,16 +3805,58 @@ elif active_tab == "自选观察池":
                 use_container_width=True,
                 key="wl_interval_seg",
             )
-        wl_frame = _cache_read(wl_choice, (start - timedelta(days=150)).strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"))
+        if wl_interval in ("周线", "月线"):
+            wl_fetch_start, wl_disp_start = "1990-01-01", None
+        else:
+            wl_fetch_start, wl_disp_start = (start - timedelta(days=150)).strftime("%Y-%m-%d"), start
+        wl_frame = _cache_read(active_wl, wl_fetch_start, end.strftime("%Y-%m-%d"))
         if not wl_frame.empty:
-            wl_panes, _ = chart_panes(wl_frame, f"{wl_name_map[wl_choice]} · {wl_choice}", wl_interval, show_ma=True, show_macd=True, display_start=start)
+            wl_latest = wl_frame.iloc[-1]
+            wl_prior = wl_frame.iloc[-2].close if len(wl_frame) > 1 else wl_latest.close
+            wl_chg = (wl_latest.close / wl_prior - 1) * 100 if wl_prior else 0.0
+            wl_amp = ((wl_latest.high - wl_latest.low) / wl_prior * 100) if wl_prior else 0.0
+            wl_feat = indicators(wl_frame)
+            wl_rsi = f"{wl_feat.iloc[-1].rsi:.1f}" if not wl_feat.empty else "—"
+            wl_macd = wl_feat.iloc[-1].macd - wl_feat.iloc[-1].signal if not wl_feat.empty else float("nan")
+            wl_macd_txt = ("多头金叉区" if wl_macd > 0 else "空头整理区") if pd.notna(wl_macd) else "—"
+            wl_turn_txt = f"{wl_latest.turn:.2f}%" if pd.notna(wl_latest.turn) else "—"
+            wl_c_cls = "is-up" if wl_chg > 0 else ("is-down" if wl_chg < 0 else "is-flat")
+            wl_chg_cls = "chg-up" if wl_chg > 0 else ("chg-down" if wl_chg < 0 else "chg-flat")
+            st.markdown(f"""
+            <div class="ticker-card">
+                <div class="ticker-top">
+                    <div class="ticker-name-wrap">
+                        <span class="ticker-name">{escape(wl_name_map[active_wl])}</span>
+                        <span class="ticker-code">{escape(active_wl)}</span>
+                    </div>
+                    <div class="ticker-price-wrap">
+                        <span class="ticker-price {wl_c_cls}">¥{wl_latest.close:.2f}</span>
+                        <span class="ticker-chg {wl_chg_cls}">{wl_chg:+.2f}%</span>
+                        <span class="mono" style="font-size:0.78rem;color:#64748b;">{pd.Timestamp(wl_latest.date):%Y-%m-%d}</span>
+                    </div>
+                </div>
+                <div class="ticker-stats">
+                    <div class="t-stat"><div class="t-stat-k">今开</div><div class="t-stat-v">{wl_latest.open:.2f}</div></div>
+                    <div class="t-stat"><div class="t-stat-k">最高</div><div class="t-stat-v is-up">{wl_latest.high:.2f}</div></div>
+                    <div class="t-stat"><div class="t-stat-k">最低</div><div class="t-stat-v is-down">{wl_latest.low:.2f}</div></div>
+                    <div class="t-stat"><div class="t-stat-k">振幅</div><div class="t-stat-v">{wl_amp:.2f}%</div></div>
+                    <div class="t-stat"><div class="t-stat-k">换手率</div><div class="t-stat-v">{wl_turn_txt}</div></div>
+                    <div class="t-stat"><div class="t-stat-k">成交额</div><div class="t-stat-v">{_fmt_amount(wl_latest.amount)}</div></div>
+                    <div class="t-stat"><div class="t-stat-k">RSI (14)</div><div class="t-stat-v">{wl_rsi}</div></div>
+                    <div class="t-stat"><div class="t-stat-k">MACD 趋势</div><div class="t-stat-v">{wl_macd_txt}</div></div>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+            wl_panes, _ = chart_panes(wl_frame, f"{wl_name_map[active_wl]} · {active_wl}", wl_interval, show_ma=True, show_macd=True, display_start=wl_disp_start)
             lightweight_charts_v5_component(
-                name=f"wl {wl_name_map[wl_choice]} {wl_choice}",
+                name=f"wl {wl_name_map[active_wl]} {active_wl}",
                 charts=wl_panes,
                 height=440 if mobile_compact else 640,
                 zoom_level=65 if mobile_compact else 85,
-                key=f"wl_chart_{wl_choice}_{wl_interval}_{mobile_compact}",
+                key=f"wl_chart_{active_wl}_{wl_interval}_{mobile_compact}",
             )
+        else:
+            st.info(f"本地暂无 {wl_name_map[active_wl]}（{active_wl}）在该区间的日线缓存。")
 
 
 # ========================== Tab 3: 策略百科矩阵 ==========================
