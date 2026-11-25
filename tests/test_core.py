@@ -216,7 +216,7 @@ def test_charts_resample_panes_and_formatters():
     assert charts._fmt_amount(3.2e4) == "3 万"
     assert charts._fmt_volume(1.5e6) == "1.50 M"
     assert "fecaca" in charts._style_pct(10.0)
-    assert "34d399" in charts._style_pct(-2.5)
+    assert "0ecb81" in charts._style_pct(-2.5)
 
 
 # ==================== 4. sync.py unit tests ====================
