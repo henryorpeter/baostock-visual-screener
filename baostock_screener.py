@@ -8,6 +8,7 @@ from html import escape
 import json
 from pathlib import Path
 import re
+import socket
 import sqlite3
 import threading
 import time
@@ -210,24 +211,50 @@ def _rows(result):
     return pd.DataFrame(rows, columns=result.fields)
 
 
+def _baostock_reachable(timeout=3.0):
+    try:
+        with socket.create_connection(("public-api.baostock.com", 10030), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
 def _query(fn):
     global BAOSTOCK_AVAILABLE
+    if not _baostock_reachable(timeout=3.0):
+        BAOSTOCK_AVAILABLE = False
+        raise RuntimeError(
+            "Baostock 服务不可达（public-api.baostock.com:10030 连接超时），已自动跳过。"
+        )
     last = None
-    for attempt in range(3):
-        login = bs.login()
-        if login.error_code == "0":
-            BAOSTOCK_AVAILABLE = True
+    prev_timeout = socket.getdefaulttimeout()
+    socket.setdefaulttimeout(10.0)
+    try:
+        for attempt in range(2):
             try:
-                return fn()
-            finally:
+                login = bs.login()
+            except Exception as exc:
+                last = type("Err", (), {"error_code": "timeout", "error_msg": str(exc)})()
+                login = None
+            if login is not None and login.error_code == "0":
+                BAOSTOCK_AVAILABLE = True
+                try:
+                    return fn()
+                finally:
+                    try:
+                        bs.logout()
+                    except Exception:
+                        pass
+            if login is not None:
+                last = login
+            try:
                 bs.logout()
-        last = login
-        try:
-            bs.logout()
-        except Exception:
-            pass
-        if attempt < 2:
-            time.sleep(1.5 * (attempt + 1))
+            except Exception:
+                pass
+            if attempt < 1:
+                time.sleep(1.0)
+    finally:
+        socket.setdefaulttimeout(prev_timeout)
     raise RuntimeError(
         f"登录失败 {last.error_code}: {last.error_msg}。"
         "这是 Baostock 网络连接错误，请检查 public-api.baostock.com:10030 是否可访问后重试。"
@@ -581,6 +608,25 @@ def _recent_trade_days(end_str, now=None):
     except Exception:
         days = []
 
+    if not days:
+        # 快速回退：探测 qt.gtimg.cn 截面日期并结合本地 SQLite 已有交易日，避免被 ifzq 限流拖进慢速 Baostock
+        snap_d = _probe_snapshot_date()
+        local_days = set()
+        if snap_d and snap_d <= end_str:
+            local_days.add(snap_d)
+        try:
+            _init_cache()
+            with sqlite3.connect(CACHE_DB, timeout=10) as conn:
+                for (d_str,) in conn.execute(
+                    "SELECT DISTINCT date FROM daily WHERE date <= ? ORDER BY date DESC LIMIT 5",
+                    (end_str,),
+                ):
+                    if d_str:
+                        local_days.add(str(d_str))
+        except Exception:
+            pass
+        days = sorted(local_days)
+
     if not days and BAOSTOCK_AVAILABLE is not False:
         try:
             start_probe = (pd.Timestamp(end_str) - pd.Timedelta(days=45)).strftime("%Y-%m-%d")
@@ -728,7 +774,7 @@ def update_cache(codes, start, end, progress):
                     LEFT JOIN daily d ON d.code = w.code
                     GROUP BY w.code
                 )
-                SELECT a.code, a.first_d, a.last_d, d.close
+                SELECT a.code, a.first_d, a.last_d, d.close, d.turn
                 FROM agg a
                 LEFT JOIN daily d ON d.code = a.code AND d.date = a.last_d
                 """
@@ -738,10 +784,14 @@ def update_cache(codes, start, end, progress):
     skipped = 0
     snapshot_candidates = []
     backfill_tasks = []
+    turn_patch_codes = []
     for code, name in codes:
-        first, last, last_close = state.get(code, (None, None, None))
+        first, last, last_close, last_turn = state.get(code, (None, None, None, None))
         if first and last and first <= start and last >= effective_end:
-            skipped += 1
+            if last_turn is None:
+                turn_patch_codes.append((code, name))
+            else:
+                skipped += 1
             continue
         if first and first <= start and prev_trade_day and last == prev_trade_day:
             snapshot_candidates.append((code, name, last_close))
@@ -754,6 +804,7 @@ def update_cache(codes, start, end, progress):
     successful, changed, failures = set(), set(), {}
     snapshot_updated, backfill_updated, ex_div_count = 0, 0, 0
     used_snapshot = False
+    snap_date = None
     snap_p_end = 0.05
 
     # 1. 批量截面极速更新：仅缺最新 1 个已收盘交易日的股票，18 次 HTTP 请求即可全部补齐
@@ -807,6 +858,7 @@ def update_cache(codes, start, end, progress):
     if backfill_tasks:
         em_lock = threading.Lock()
         em_fail_streak = [0]
+        tx_fail_streak = [0]
         total_bf = len(backfill_tasks)
         base_p = snap_p_end if used_snapshot else 0.05
 
@@ -814,6 +866,7 @@ def update_cache(codes, start, end, progress):
             code, name, fetch_start = task
             with em_lock:
                 skip_em = em_fail_streak[0] >= 12
+                skip_tx = tx_fail_streak[0] >= 12
             if not skip_em:
                 try:
                     frame = _history_eastmoney(code, fetch_start, effective_end, name=name)
@@ -823,7 +876,17 @@ def update_cache(codes, start, end, progress):
                 except Exception:
                     with em_lock:
                         em_fail_streak[0] += 1
-            return _history_http(code, fetch_start, effective_end, name=name)
+            if skip_tx:
+                raise RuntimeError("腾讯历史接口连续限流，已熔断跳过")
+            try:
+                frame = _history_http(code, fetch_start, effective_end, name=name)
+                with em_lock:
+                    tx_fail_streak[0] = 0
+                return frame
+            except Exception:
+                with em_lock:
+                    tx_fail_streak[0] += 1
+                raise
 
         batch_frames = []
         with ThreadPoolExecutor(max_workers=10) as pool:
@@ -836,6 +899,8 @@ def update_cache(codes, start, end, progress):
                         batch_frames.append(frame)
                         changed.add(code)
                         backfill_updated += 1
+                        if frame["turn"].isna().any():
+                            turn_patch_codes.append((code, name))
                     successful.add(code)
                     failures.pop(code, None)
                 except Exception as exc:
@@ -850,7 +915,57 @@ def update_cache(codes, start, end, progress):
         if batch_frames:
             _cache_write(pd.concat(batch_frames, ignore_index=True))
 
-    # 3. 仅针对 HTTPS 均失败的个别残余标的启用 Baostock 兜底
+    # 3. 补齐缺失换手率：若回补降级到腾讯 fqkline（无换手率）或库中最新日换手率为空，用腾讯批量快照极速补齐
+    turn_patched = 0
+    if turn_patch_codes:
+        dedup_patch = list({c: n for c, n in turn_patch_codes}.items())
+        snaps = _fetch_tencent_snapshots(dedup_patch, progress=progress, progress_range=(0.90, 0.96))
+        exact_updates = []
+        hist_updates = []
+        for code, _ in dedup_patch:
+            snap = snaps.get(code)
+            if not snap:
+                continue
+            turn_v = snap["turn"]
+            if np.isnan(turn_v) or turn_v <= 0 or snap["volume"] <= 0:
+                continue
+            if snap["date"] == effective_end:
+                exact_updates.append((
+                    turn_v, snap["amount"], snap["amount"], snap["pctChg"], code, effective_end,
+                ))
+            # shortcut: 历史缺失换手率按当日快照反推当前流通股本估算，若期间发生定增/解禁存在轻微偏差，仅补填 NULL 不覆盖真实值
+            float_shares = snap["volume"] / (turn_v / 100.0)
+            if float_shares > 0:
+                hist_updates.append((float_shares, code))
+        if exact_updates or hist_updates:
+            with sqlite3.connect(CACHE_DB, timeout=30) as conn:
+                if exact_updates:
+                    conn.executemany(
+                        "UPDATE daily SET turn = ?, amount = CASE WHEN ? > 0 THEN ? ELSE amount END, pctChg = ? "
+                        "WHERE code = ? AND date = ?",
+                        exact_updates,
+                    )
+                if hist_updates:
+                    conn.executemany(
+                        "UPDATE daily SET turn = ROUND(volume / ? * 100.0, 2) "
+                        "WHERE code = ? AND turn IS NULL AND volume > 0",
+                        hist_updates,
+                    )
+                conn.execute(
+                    "INSERT OR REPLACE INTO app_settings(key, value) VALUES ('cache_rev', ?)",
+                    (str(int(time.time() * 1000)),),
+                )
+            _invalidate_status_cache()
+            turn_patched = max(len(exact_updates), len(hist_updates))
+            used_snapshot = True
+            for _, _, _, _, c, _ in exact_updates:
+                changed.add(c)
+            for _, c in hist_updates:
+                changed.add(c)
+        else:
+            skipped += len(dedup_patch)
+
+    # 4. 仅针对 HTTPS 均失败的个别残余标的启用 Baostock 兜底（先 3 秒探活避免卡死）
     remaining = [(code, fetch_start) for code, _, fetch_start in backfill_tasks if code not in successful]
     if remaining and BAOSTOCK_AVAILABLE is not False:
         def fetch_baostock():
@@ -871,7 +986,7 @@ def update_cache(codes, start, end, progress):
                     _cache_write(pd.concat(batch, ignore_index=True))
                     batch.clear()
                 if progress is not None and (i % 10 == 0 or i == tot_rem):
-                    progress.progress(0.95 + 0.05 * (i / max(1, tot_rem)), text=f"Baostock 兜底 {i}/{tot_rem}")
+                    progress.progress(0.96 + 0.04 * (i / max(1, tot_rem)), text=f"Baostock 兜底 {i}/{tot_rem}")
             if batch:
                 _cache_write(pd.concat(batch, ignore_index=True))
         try:
@@ -901,7 +1016,7 @@ def update_cache(codes, start, end, progress):
         "failures": list(failures.items())[:10],
         "source": source,
         "effective_end": effective_end,
-        "snapshot_updated": snapshot_updated,
+        "snapshot_updated": snapshot_updated + turn_patched,
         "backfill_updated": backfill_updated,
         "ex_div": ex_div_count,
     }
@@ -1054,11 +1169,12 @@ def _cache_version():
     _init_cache()
     with sqlite3.connect(CACHE_DB, timeout=30) as conn:
         rows, newest = conn.execute("SELECT COUNT(*), COALESCE(MAX(date), '') FROM daily").fetchone()
-    return int(rows or 0), str(newest or "")
+        rev_row = conn.execute("SELECT value FROM app_settings WHERE key='cache_rev'").fetchone()
+    return int(rows or 0), str(newest or ""), (rev_row[0] if rev_row else "0")
 
 
 @st.cache_resource(max_entries=3, show_spinner=False)
-def _load_market_arrays_cached(start, end, db_rows, db_newest):
+def _load_market_arrays_cached(start, end, db_rows, db_newest, db_rev="0"):
     """一次性从 SQLite 载入全市场行情并按股票拆分为只读 NumPy 数组字典（带版本感知内存缓存）。"""
     _init_cache()
     with sqlite3.connect(CACHE_DB, timeout=30) as conn:
@@ -2780,10 +2896,10 @@ def _run_screen_action(
         selected = universe[::stride][:limit]
         # 为保证 MA60/MACD/RSI/RPS 等指标充分预热且数据精准，后台自动向前多读取前置历史行情
         lookback_start = min(start, end - timedelta(days=210))
-        db_rows, db_newest = _cache_version()
+        db_rows, db_newest, db_rev = _cache_version()
         tracker.update(0.08, stage=1, detail=f"正在从本地缓存加载全市场行情（共 {db_rows:,} 条记录）…")
         frames = _load_market_arrays_cached(
-            lookback_start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"), db_rows, db_newest
+            lookback_start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"), db_rows, db_newest, db_rev
         )
         if not frames:
             tracker.close()
