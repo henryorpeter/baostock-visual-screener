@@ -1,0 +1,425 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>KLineRadar · A股选股与看盘终端</title>
+  <link rel="stylesheet" href="/static/app.css?v=4" />
+  <script src="/static/lightweight-charts.standalone.production.js" defer></script>
+  <script src="/static/app.js?v=4" defer></script>
+</head>
+<body>
+  <!-- ==================== TOP BAR ==================== -->
+  <header class="topbar">
+    <div class="topbar-left">
+      <div class="brand" id="brandLogo" title="KLineRadar">
+        <svg class="brand-icon" viewBox="0 0 18 18" width="17" height="17" aria-hidden="true">
+          <rect x="2.5" y="7" width="3" height="6.5" rx="0.6" fill="var(--down)" />
+          <line x1="4" y1="4.5" x2="4" y2="15" stroke="var(--down)" stroke-width="1.3" />
+          <rect x="7.5" y="4.5" width="3" height="7" rx="0.6" fill="var(--up)" />
+          <line x1="9" y1="2.2" x2="9" y2="13.5" stroke="var(--up)" stroke-width="1.3" />
+          <rect x="12.5" y="3" width="3" height="8" rx="0.6" fill="var(--up)" />
+          <line x1="14" y1="1.2" x2="14" y2="13" stroke="var(--up)" stroke-width="1.3" />
+        </svg>
+        <span class="brand-name">KLineRadar</span>
+      </div>
+
+      <nav class="nav-tabs" id="navTabs">
+        <button class="nav-tab active" data-view="terminal" type="button">行情终端</button>
+        <button class="nav-tab" data-view="strategies" type="button">策略矩阵</button>
+        <button class="nav-tab" data-view="cache" type="button">数据缓存</button>
+      </nav>
+    </div>
+
+    <div class="topbar-right">
+      <div class="search-box" id="globalSearchWrap">
+        <svg class="search-icon" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
+          <circle cx="7" cy="7" r="4.8" fill="none" stroke="currentColor" stroke-width="1.5" />
+          <line x1="10.6" y1="10.6" x2="14" y2="14" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" />
+        </svg>
+        <input id="globalSearchInput" type="text" autocomplete="off" placeholder="搜索股票代码或简称" />
+        <kbd class="kbd-hint">/</kbd>
+        <div class="search-dropdown hidden" id="globalSearchResults"></div>
+      </div>
+
+      <button class="status-readout" id="navStatusBtn" type="button" title="查看本地行情缓存">
+        <span id="navStatusText">加载缓存中...</span>
+      </button>
+
+      <button class="btn-ghost btn-sync" id="navSyncBtn" type="button" title="增量同步最新日线行情">
+        <svg class="sync-icon" viewBox="0 0 16 16" width="13" height="13" aria-hidden="true">
+          <path d="M13.5 8a5.5 5.5 0 0 1-9.6 3.7M2.5 8a5.5 5.5 0 0 1 9.6-3.7" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" />
+          <path d="M12.3 1.9v2.8H9.5M3.7 14.1v-2.8h2.8" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" />
+        </svg>
+        <span id="navSyncLabel">同步行情</span>
+      </button>
+
+      <button class="btn-icon" id="themeToggleBtn" type="button" title="切换暗色 / 亮色主题" aria-label="切换主题">
+        <svg class="icon-sun" viewBox="0 0 16 16" width="15" height="15" aria-hidden="true">
+          <circle cx="8" cy="8" r="3" fill="none" stroke="currentColor" stroke-width="1.4" />
+          <path d="M8 1.5v1.6M8 12.9v1.6M1.5 8h1.6M12.9 8h1.6M3.4 3.4l1.1 1.1M11.5 11.5l1.1 1.1M12.6 3.4l-1.1 1.1M4.5 11.5l-1.1 1.1" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" />
+        </svg>
+        <svg class="icon-moon" viewBox="0 0 16 16" width="15" height="15" aria-hidden="true">
+          <path d="M13.2 10.1A5.6 5.6 0 0 1 5.9 2.8a5.6 5.6 0 1 0 7.3 7.3z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" />
+        </svg>
+      </button>
+    </div>
+  </header>
+
+  <!-- ==================== VIEW 1: TERMINAL ==================== -->
+  <main class="view active" id="view-terminal">
+    <!-- Slim Screener Control Ribbon -->
+    <section class="screener-bar">
+      <div class="screener-left">
+        <div class="group-chips" id="groupChips"></div>
+
+        <div class="popover-anchor">
+          <button class="btn-select" id="stratPickerBtn" type="button">
+            <span>策略</span>
+            <span class="pill-count" id="stratSelectedCount">0</span>
+            <span class="caret">▾</span>
+          </button>
+          <div class="popover strat-popover hidden" id="stratPickerPopover">
+            <div class="popover-head">
+              <span class="popover-title">选择选股策略（可多选共振）</span>
+              <div class="popover-actions">
+                <button class="link-btn" id="stratSelectAllBtn" type="button">全选 20</button>
+                <button class="link-btn" id="stratClearAllBtn" type="button">清空</button>
+              </div>
+            </div>
+            <div class="strat-popover-body" id="stratPickerBody"></div>
+          </div>
+        </div>
+
+        <span class="v-sep"></span>
+
+        <button class="toggle-chip active" id="toggleExcludeSt" type="button">排除ST</button>
+        <button class="toggle-chip" id="toggleExcludeGem" type="button">排除双创</button>
+
+        <label class="inline-field" title="当日最低涨跌幅(%)">
+          <span>涨幅≥</span>
+          <input id="inputMinChange" type="number" step="0.5" value="0" />
+          <span class="unit">%</span>
+        </label>
+
+        <label class="inline-field" title="当日最低成交额(亿元)">
+          <span>额≥</span>
+          <input id="inputMinAmount" type="number" step="0.5" min="0" value="0" />
+          <span class="unit">亿</span>
+        </label>
+
+        <div class="popover-anchor">
+          <button class="btn-select" id="moreFilterBtn" type="button">
+            <span>区间与高级</span>
+            <span class="caret">▾</span>
+          </button>
+          <div class="popover more-popover hidden" id="moreFilterPopover">
+            <div class="popover-head">
+              <span class="popover-title">扫描区间与过滤参数</span>
+            </div>
+            <div class="more-body">
+              <div class="field-row">
+                <span class="field-label">快捷区间</span>
+                <div class="preset-group">
+                  <button class="preset-btn" data-days="90" type="button">90天</button>
+                  <button class="preset-btn active" data-days="180" type="button">180天</button>
+                  <button class="preset-btn" data-days="365" type="button">1年</button>
+                </div>
+              </div>
+              <div class="field-grid-2">
+                <label class="stack-field">
+                  <span>开始日期</span>
+                  <input id="inputStartDate" type="date" />
+                </label>
+                <label class="stack-field">
+                  <span>截止日期</span>
+                  <input id="inputEndDate" type="date" />
+                </label>
+              </div>
+              <div class="field-grid-2">
+                <label class="stack-field">
+                  <span>最高换手率 (%)</span>
+                  <input id="inputMaxTurn" type="number" min="1" max="100" step="1" value="100" />
+                </label>
+                <label class="stack-field">
+                  <span>最大扫描股数</span>
+                  <input id="inputMaxStocks" type="number" min="100" max="6000" step="500" value="6000" />
+                </label>
+              </div>
+              <div class="more-hint">将截止日期设为历史交易日，可自动触发「历史胜率速验」</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="screener-right">
+        <button class="btn-primary" id="btnRunScreen" type="button">
+          <span class="btn-spinner hidden" id="screenSpinner"></span>
+          <span id="screenBtnText">开始选股</span>
+        </button>
+      </div>
+    </section>
+
+    <!-- Main Split Workspace -->
+    <div class="workspace">
+      <!-- Left: Empty Placeholder OR Native Multi-Pane K-line Terminal -->
+      <section class="left-stage">
+        <!-- Pre-Scan Placeholder (Instant startup, zero K-line overhead) -->
+        <div class="empty-stage" id="emptyStage">
+          <div class="empty-inner">
+            <svg class="empty-mark" viewBox="0 0 64 40" width="56" height="36" aria-hidden="true">
+              <line x1="10" y1="8" x2="10" y2="33" stroke="currentColor" stroke-width="1.5" opacity="0.4" />
+              <rect x="7" y="15" width="6" height="12" rx="1" fill="var(--down)" opacity="0.7" />
+              <line x1="24" y1="12" x2="24" y2="36" stroke="currentColor" stroke-width="1.5" opacity="0.4" />
+              <rect x="21" y="18" width="6" height="11" rx="1" fill="var(--down)" opacity="0.55" />
+              <line x1="38" y1="6" x2="38" y2="30" stroke="currentColor" stroke-width="1.5" opacity="0.4" />
+              <rect x="35" y="11" width="6" height="13" rx="1" fill="var(--up)" opacity="0.85" />
+              <line x1="52" y1="3" x2="52" y2="25" stroke="currentColor" stroke-width="1.5" opacity="0.4" />
+              <rect x="49" y="6" width="6" height="14" rx="1" fill="var(--up)" />
+            </svg>
+            <h1 class="empty-title">请先选股或搜索个股</h1>
+            <p class="empty-sub" id="emptySubtitle">已默认勾选「趋势突破」策略组 · 点击下方按钮立即全市场扫描，或按 <kbd>/</kbd> 搜索任意股票看盘</p>
+
+            <div class="empty-actions">
+              <button class="btn-primary btn-lg" id="btnEmptyRunScreen" type="button">按当前策略开始选股</button>
+            </div>
+
+            <div class="empty-quick-row">
+              <span class="empty-quick-label">按流派速选：</span>
+              <div class="empty-quick-groups" id="emptyQuickGroups"></div>
+            </div>
+
+            <div class="empty-wl-row hidden" id="emptyWatchlistRow">
+              <span class="empty-quick-label">自选快捷看盘：</span>
+              <div class="empty-wl-chips" id="emptyWatchlistChips"></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Active Stock K-line Terminal -->
+        <div class="chart-stage hidden" id="chartStage">
+          <!-- Ticker Strip -->
+          <div class="ticker-strip" id="tickerStrip">
+            <div class="ticker-id">
+              <button class="btn-star" id="btnToggleWatchlist" type="button" title="加入 / 移出自选池">☆</button>
+              <div class="ticker-title-wrap">
+                <span class="ticker-name" id="tickerName">--</span>
+                <span class="ticker-code" id="tickerCode">--</span>
+              </div>
+              <div class="ticker-price-wrap">
+                <span class="ticker-price" id="tickerPrice">--</span>
+                <span class="ticker-pct" id="tickerChange">--</span>
+              </div>
+            </div>
+
+            <div class="ticker-metrics" id="tickerStats"></div>
+
+            <div class="ticker-end">
+              <div class="ticker-tags" id="tickerTags"></div>
+              <div class="step-nav">
+                <button class="btn-step" id="btnPrevStock" type="button" title="上一只 (↑)">‹</button>
+                <button class="btn-step" id="btnNextStock" type="button" title="下一只 (↓)">›</button>
+              </div>
+            </div>
+          </div>
+
+          <!-- Chart Indicator Toolbar -->
+          <div class="chart-toolbar" id="chartToolbar">
+            <div class="tb-group" id="intervalGroup">
+              <button class="tb-btn active" data-interval="日线" type="button">日线</button>
+              <button class="tb-btn" data-interval="周线" type="button">周线</button>
+              <button class="tb-btn" data-interval="月线" type="button">月线</button>
+            </div>
+
+            <span class="v-sep"></span>
+
+            <div class="tb-group">
+              <span class="tb-label">主图</span>
+              <div class="tb-chips" id="overlayChips"></div>
+            </div>
+
+            <span class="v-sep"></span>
+
+            <div class="tb-group">
+              <span class="tb-label">副图</span>
+              <div class="tb-chips" id="subChips"></div>
+            </div>
+
+            <button class="tb-reset" id="btnResetZoom" type="button" title="自适应缩放视图">重置</button>
+          </div>
+
+          <!-- Live Crosshair OHLCV + Main Overlay Legend -->
+          <div class="crosshair-legend" id="crosshairLegend"></div>
+
+          <!-- Multi-pane LightweightCharts Canvas -->
+          <div class="chart-scroll-wrap" id="chartScrollWrap">
+            <div class="chart-canvas-host" id="chartMount"></div>
+            <div class="subpane-legends" id="subpaneLegends"></div>
+            <div class="chart-loading hidden" id="chartLoading">加载行情中...</div>
+          </div>
+
+          <!-- Optional Historical Forward-Return Verification Drawer -->
+          <div class="fwd-drawer hidden" id="fwdDrawer">
+            <button class="fwd-header" id="fwdToggleBtn" type="button">
+              <span>历史胜率速验（截止日后 5 / 10 交易日）</span>
+              <span id="fwdToggleCaret">▾</span>
+            </button>
+            <div class="fwd-body" id="fwdBody">
+              <table class="fwd-table">
+                <thead>
+                  <tr>
+                    <th>策略</th>
+                    <th class="num">样本数</th>
+                    <th class="num">5日胜率</th>
+                    <th class="num">5日均涨</th>
+                    <th class="num">10日胜率</th>
+                    <th class="num">10日均涨</th>
+                  </tr>
+                </thead>
+                <tbody id="fwdTableBody"></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Right: Signal List & Watchlist Dock -->
+      <aside class="right-dock">
+        <div class="dock-head">
+          <div class="dock-tabs">
+            <button class="dock-tab active" id="dockTabSignals" type="button">
+              <span>选股信号</span>
+              <span class="dock-badge" id="badgeSignals">0</span>
+            </button>
+            <button class="dock-tab" id="dockTabWatchlist" type="button">
+              <span>自选池</span>
+              <span class="dock-badge" id="badgeWatchlist">0</span>
+            </button>
+          </div>
+
+          <div class="popover-anchor">
+            <button class="btn-mini" id="exportMenuBtn" type="button">导出 ▾</button>
+            <div class="popover export-popover hidden" id="exportDropdown">
+              <button class="menu-item" data-export="csv" type="button">导出选股明细 (.csv)</button>
+              <button class="menu-item" data-export="ebk" type="button">通达信板块 (.ebk)</button>
+              <button class="menu-item" data-export="txt" type="button">纯 6 位代码 (.txt)</button>
+              <button class="menu-item" data-export="copy" type="button">复制全部 6 位代码</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="dock-controls" id="dockFilterBar">
+          <div class="seg-mini">
+            <button class="seg-btn active" id="modeAggBtn" type="button">共振聚合</button>
+            <button class="seg-btn" id="modeAllBtn" type="button">全部信号</button>
+          </div>
+          <select class="dock-select" id="dockSortSelect" title="排序方式">
+            <option value="resonance">按共振</option>
+            <option value="pct_desc">涨幅降序</option>
+            <option value="pct_asc">涨幅升序</option>
+            <option value="turn_desc">换手降序</option>
+            <option value="amount_desc">成交额降序</option>
+          </select>
+        </div>
+
+        <div class="dock-search-row" id="dockSearchRow">
+          <select class="dock-select hidden" id="dockStrategyFilter" title="按命中策略筛选"></select>
+          <input class="dock-search" id="dockSearchInput" type="text" placeholder="列表内过滤代码 / 简称" />
+        </div>
+
+        <div class="dock-summary hidden" id="dockSummary"></div>
+
+        <div class="list-cols">
+          <span>股票</span>
+          <span class="col-spark">20日走势</span>
+          <span class="col-right">现价 / 涨幅</span>
+          <span class="col-right">换手 / 额</span>
+        </div>
+
+        <div class="dock-list" id="dockList"></div>
+      </aside>
+    </div>
+  </main>
+
+  <!-- ==================== VIEW 2: STRATEGY MATRIX ==================== -->
+  <main class="view" id="view-strategies">
+    <div class="page-wrap">
+      <div class="page-head">
+        <div>
+          <h2 class="page-title">20 套形态与指标策略矩阵</h2>
+          <p class="page-sub">全市场高速扫描 · 支持自由组合多策略共振，点击任一流派或单策略即可应用</p>
+        </div>
+        <button class="btn-primary" id="btnMatrixRun" type="button">使用已选策略开始选股</button>
+      </div>
+      <div class="matrix-grid" id="strategyMatrixGrid"></div>
+    </div>
+  </main>
+
+  <!-- ==================== VIEW 3: CACHE & SYNC ==================== -->
+  <main class="view" id="view-cache">
+    <div class="page-wrap">
+      <div class="page-head">
+        <div>
+          <h2 class="page-title">本地行情数据库与增量同步</h2>
+          <p class="page-sub">全市场日线保存在本地 SQLite，断网可用；收盘后支持自动增量补齐，多源自动容灾</p>
+        </div>
+        <button class="btn-primary" id="btnManualSync" type="button">立即增量同步</button>
+      </div>
+
+      <div class="kpi-strip" id="cacheKpiStrip">
+        <div class="kpi-cell">
+          <span class="kpi-label">已覆盖股票</span>
+          <span class="kpi-val" id="kpiStocks">--</span>
+        </div>
+        <div class="kpi-cell">
+          <span class="kpi-label">日线总记录</span>
+          <span class="kpi-val" id="kpiRows">--</span>
+        </div>
+        <div class="kpi-cell">
+          <span class="kpi-label">最新交易日</span>
+          <span class="kpi-val" id="kpiNewest">--</span>
+        </div>
+        <div class="kpi-cell">
+          <span class="kpi-label">本地库体积</span>
+          <span class="kpi-val" id="kpiSize">--</span>
+        </div>
+      </div>
+
+      <div class="sync-panel">
+        <div class="sync-section">
+          <div class="section-title">同步任务状态</div>
+          <div class="sync-progress-wrap" id="syncProgressWrap">
+            <div class="progress-track">
+              <div class="progress-fill" id="syncProgressBar" style="width: 0%"></div>
+            </div>
+            <div class="sync-meta-row">
+              <span id="syncPhaseText">空闲</span>
+              <span class="mono" id="syncProgressText">0%</span>
+            </div>
+          </div>
+          <div class="sync-note" id="autoSyncStatusText">--</div>
+        </div>
+
+        <div class="sync-section">
+          <div class="section-title">收盘后自动增量同步</div>
+          <div class="sync-form-row">
+            <label class="switch-row">
+              <input type="checkbox" id="autoSyncEnabled" checked />
+              <span>启用每日收盘后自动同步</span>
+            </label>
+            <label class="inline-field">
+              <span>触发时间</span>
+              <select class="dock-select" id="autoSyncTime"></select>
+            </label>
+            <button class="btn-ghost" id="btnSaveSyncConfig" type="button">保存设置</button>
+          </div>
+          <div class="sync-note">数据源自动容灾顺序：东方财富 / 腾讯财经 / 新浪前复权 / Baostock，自动剔除退市股</div>
+          <div class="sync-note mono" id="cacheDbPath"></div>
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <div class="toast-host" id="toastHost"></div>
+</body>
+</html>

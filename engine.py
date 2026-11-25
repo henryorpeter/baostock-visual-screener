@@ -1,5 +1,7 @@
 """纯 NumPy 向量化技术指标、20 套选股策略引擎、历史胜率速验与外部软件导出工具。"""
+from collections import OrderedDict
 from datetime import date
+import threading
 import time
 import requests
 
@@ -8,6 +10,26 @@ import pandas as pd
 import streamlit as st
 
 import db
+
+_ARRAY_CACHE_LOCK = threading.Lock()
+_ARRAY_CACHE = OrderedDict()
+
+
+def load_market_arrays(start, end, db_rows, db_newest, db_rev="0"):
+    """纯 Python 线程安全 LRU 缓存版全市场 NumPy 数组加载（不依赖 Streamlit 运行时）。"""
+    key = (start, end, db_rows, db_newest, db_rev)
+    with _ARRAY_CACHE_LOCK:
+        cached = _ARRAY_CACHE.get(key)
+        if cached is not None:
+            _ARRAY_CACHE.move_to_end(key)
+            return cached
+    data = _load_market_arrays_cached.__wrapped__(start, end, db_rows, db_newest, db_rev)
+    with _ARRAY_CACHE_LOCK:
+        _ARRAY_CACHE[key] = data
+        _ARRAY_CACHE.move_to_end(key)
+        while len(_ARRAY_CACHE) > 3:
+            _ARRAY_CACHE.popitem(last=False)
+    return data
 
 
 STRATEGIES = {

@@ -10,5 +10,5 @@ echo ====================================================
 echo  正在启动 KLineRadar A股选股与看盘终端...
 echo  本机访问: http://localhost:%PORT%
 echo ====================================================
-".venv\Scripts\streamlit.exe" run app.py --server.port %PORT% --server.address 0.0.0.0
+".venv\Scripts\python.exe" web_server.py --port %PORT% --open
 pause

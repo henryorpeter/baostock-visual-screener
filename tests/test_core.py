@@ -274,7 +274,135 @@ def test_sync_recent_trade_days_and_auto_sync_schedule(isolated_db, monkeypatch)
     assert ok is True
 
 
-# ==================== 5. AppTest E2E smoke tests ====================
+# ==================== 5. Web API (Starlette ASGI) tests ====================
+
+def _asgi_call(app, method, path, query_string="", json_body=None):
+    """零外部依赖（无需 httpx）的轻量 Starlette ASGI 直接调用器。"""
+    import asyncio
+    import json
+
+    raw_body = json.dumps(json_body).encode("utf-8") if json_body is not None else b""
+    headers = [(b"host", b"testserver")]
+    if json_body is not None:
+        headers.append((b"content-type", b"application/json"))
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": method.upper(),
+        "scheme": "http",
+        "path": path,
+        "raw_path": path.encode("utf-8"),
+        "query_string": query_string.encode("utf-8"),
+        "headers": headers,
+        "client": ("127.0.0.1", 0),
+        "server": ("testserver", 8506),
+    }
+    sent = {"done": False}
+    done_evt = asyncio.Event()
+    status_code = 500
+    resp_headers = {}
+    chunks = []
+
+    async def receive():
+        if not sent["done"]:
+            sent["done"] = True
+            return {"type": "http.request", "body": raw_body, "more_body": False}
+        await done_evt.wait()
+        return {"type": "http.disconnect"}
+
+    async def send(message):
+        nonlocal status_code
+        if message["type"] == "http.response.start":
+            status_code = message["status"]
+            for k, v in message.get("headers", []):
+                resp_headers[k.decode("latin1").lower()] = v.decode("latin1")
+        elif message["type"] == "http.response.body":
+            chunks.append(message.get("body", b""))
+            if not message.get("more_body", False):
+                done_evt.set()
+
+    async def run():
+        await app(scope, receive, send)
+
+    asyncio.run(run())
+    body_bytes = b"".join(chunks)
+    return status_code, resp_headers, body_bytes
+
+
+def test_web_server_api_end_to_end(isolated_db):
+    import json
+    import web_server
+
+    df = _make_ohlcv(n=130, seed=17, trend=0.002, code="sh.600519")
+    df.iloc[-1, df.columns.get_loc("open")] = df["close"].iloc[-2] * 1.01
+    df.iloc[-1, df.columns.get_loc("close")] = df["high"].iloc[-21:-1].max() * 1.04
+    df.iloc[-1, df.columns.get_loc("high")] = df["close"].iloc[-1] * 1.01
+    df.iloc[-1, df.columns.get_loc("low")] = df["open"].iloc[-1] * 0.99
+    df.iloc[-1, df.columns.get_loc("volume")] = df["volume"].iloc[-21:-1].mean() * 3.0
+    df.iloc[-1, df.columns.get_loc("amount")] = 3.2e8
+    df.iloc[-1, df.columns.get_loc("turn")] = 4.5
+    df.iloc[-1, df.columns.get_loc("pctChg")] = 6.2
+    db._cache_write(df)
+    db.cache_universe_save(pd.DataFrame([{"code": "sh.600519", "code_name": "贵州茅台"}]))
+    web_server._get_universe_cached(force=True)
+
+    # 1. Index HTML & bootstrap
+    st, _, html_bytes = _asgi_call(web_server.web_app, "GET", "/")
+    assert st == 200 and b"KLineRadar" in html_bytes
+
+    st, _, raw = _asgi_call(web_server.web_app, "GET", "/api/bootstrap")
+    assert st == 200
+    boot = json.loads(raw)
+    assert boot["status"]["stocks"] == 1
+    assert len(boot["strategies"]) == 20
+    assert "BOLL" in boot["main_overlays"] and "KDJ" in boot["sub_indicators"]
+
+    # 2. Search
+    st, _, raw = _asgi_call(web_server.web_app, "GET", "/api/search", "q=600519")
+    assert st == 200 and json.loads(raw)["items"][0]["code"] == "sh.600519"
+
+    # 3. Screen (also verifies dict-based column mapping for pctChg/turn/amount_yi)
+    last_day = df["date"].iloc[-1].strftime("%Y-%m-%d")
+    first_day = df["date"].iloc[0].strftime("%Y-%m-%d")
+    st, _, raw = _asgi_call(
+        web_server.web_app,
+        "POST",
+        "/api/screen",
+        json_body={
+            "strategies": ["海龟突破策略", "阻力位突破策略"],
+            "start": first_day,
+            "end": last_day,
+            "exclude_st": True,
+        },
+    )
+    assert st == 200
+    scr = json.loads(raw)
+    assert len(scr["aggregated"]) == 1
+    sig = scr["signals"][0]
+    assert sig["code"] == "sh.600519"
+    assert sig["pctChg"] == 6.2 and sig["turn"] == 4.5 and sig["amount_yi"] == 3.2
+
+    # 4. K-line with all 14 indicators
+    st, _, raw = _asgi_call(web_server.web_app, "GET", "/api/kline/sh.600519", f"interval=日线&start={first_day}&end={last_day}")
+    assert st == 200
+    kl = json.loads(raw)
+    assert kl["code"] == "sh.600519" and len(kl["bars"]) == 130
+    last_bar = kl["bars"][-1]
+    for col in ("ma5", "ema12", "boll_up", "bbi", "sar", "kc_up", "dif", "kdj_k", "rsi6", "wr10", "cci", "obv", "atr14"):
+        assert last_bar[col] is not None
+
+    # 5. Watchlist CRUD & Export
+    st, _, raw = _asgi_call(web_server.web_app, "POST", "/api/watchlist", json_body={"code": "sh.600519", "name": "贵州茅台"})
+    assert st == 200 and len(json.loads(raw)["items"]) == 1
+    st, _, raw = _asgi_call(web_server.web_app, "DELETE", "/api/watchlist/sh.600519")
+    assert st == 200 and json.loads(raw)["items"] == []
+
+    st, hdrs, ebk = _asgi_call(web_server.web_app, "POST", "/api/export", json_body={"format": "ebk", "codes": ["sh.600519"]})
+    assert st == 200 and ebk == b"1600519\r\n" and ".ebk" in hdrs.get("content-disposition", "")
+
+
+# ==================== 6. Legacy AppTest E2E smoke tests ====================
 
 @pytest.mark.parametrize("entry_file", ["app.py", "baostock_screener.py"])
 def test_streamlit_entrypoints_boot_without_exceptions(entry_file):

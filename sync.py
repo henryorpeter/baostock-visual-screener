@@ -1055,10 +1055,24 @@ class AutoSyncManager:
             }
 
 
+_SINGLETON_LOCK = threading.Lock()
+_SINGLETON_MGR = None
+
+
+def get_sync_manager_singleton():
+    """纯 Python 进程级单例（不依赖 Streamlit 运行时）。"""
+    global _SINGLETON_MGR
+    if _SINGLETON_MGR is None:
+        with _SINGLETON_LOCK:
+            if _SINGLETON_MGR is None:
+                mgr = AutoSyncManager()
+                mgr.start()
+                _SINGLETON_MGR = mgr
+    return _SINGLETON_MGR
+
+
 @st.cache_resource
 def get_auto_sync_manager():
-    mgr = AutoSyncManager()
-    mgr.start()
-    return mgr
+    return get_sync_manager_singleton()
 
 
