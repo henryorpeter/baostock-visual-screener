@@ -383,6 +383,24 @@ def test_web_server_api_end_to_end(isolated_db):
     assert sig["code"] == "sh.600519"
     assert sig["pctChg"] == 6.2 and sig["turn"] == 4.5 and sig["amount_yi"] == 3.2
 
+    # 3b. Streaming NDJSON progress endpoint (/api/screen/stream)
+    st, hdrs, stream_raw = _asgi_call(
+        web_server.web_app,
+        "POST",
+        "/api/screen/stream",
+        json_body={
+            "strategies": ["海龟突破策略"],
+            "start": first_day,
+            "end": last_day,
+            "exclude_st": True,
+        },
+    )
+    assert st == 200 and "ndjson" in hdrs.get("content-type", "")
+    events = [json.loads(line) for line in stream_raw.decode("utf-8").splitlines() if line.strip()]
+    assert any(e["type"] == "progress" for e in events)
+    res_evts = [e for e in events if e["type"] == "result"]
+    assert len(res_evts) == 1 and len(res_evts[0]["data"]["aggregated"]) == 1
+
     # 4. K-line with all 14 indicators
     st, _, raw = _asgi_call(web_server.web_app, "GET", "/api/kline/sh.600519", f"interval=日线&start={first_day}&end={last_day}")
     assert st == 200

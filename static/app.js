@@ -673,6 +673,19 @@
   }
 
   // ==================== SCREENING ====================
+  function updateScanProgress(pct, detail, scanned, total, hits) {
+    const p = Math.max(0, Math.min(100, Math.round(pct)));
+    $("screenPct").textContent = `${p}%`;
+    $("screenBarFill").style.width = `${p}%`;
+    $("scanToplineFill").style.width = `${p}%`;
+    if (detail) $("screenDetail").textContent = detail;
+    if (total > 0) {
+      $("screenLiveStats").textContent = `已扫描 ${scanned.toLocaleString()} / ${total.toLocaleString()} 只 · 命中 ${hits} 条信号`;
+    } else {
+      $("screenLiveStats").textContent = "正在读取本地行情数据，首次加载约需 3~5 秒…";
+    }
+  }
+
   async function runScreen() {
     const strategies = Array.from(state.selectedStrategies);
     if (!strategies.length) {
@@ -686,6 +699,15 @@
     emptyBtn.disabled = true;
     $("screenSpinner").classList.remove("hidden");
     $("screenBtnText").textContent = "扫描中...";
+    $("scanTopline").classList.remove("hidden");
+    $("screenOverlay").classList.remove("hidden");
+    updateScanProgress(4, "正在连接选股引擎…", 0, 0, 0);
+
+    const t0 = performance.now();
+    $("screenElapsed").textContent = "0.0s";
+    const elapsedTimer = setInterval(() => {
+      $("screenElapsed").textContent = `${((performance.now() - t0) / 1000).toFixed(1)}s`;
+    }, 100);
 
     try {
       const payload = {
@@ -699,11 +721,63 @@
         exclude_st: state.excludeSt,
         exclude_gem_star: state.excludeGem,
       };
-      const data = await apiJson("/api/screen", {
+      const res = await fetch("/api/screen/stream", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
       });
+
+      let data = null;
+      if (res.status === 404) {
+        // 兼容尚未重启旧进程的情况：自动降级到 /api/screen 并维持平滑进度显示
+        updateScanProgress(35, "正在扫描全市场日线行情（重启 start.bat 后支持实时逐股进度）…", 0, 0, 0);
+        data = await apiJson("/api/screen", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+      } else if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        throw new Error(errData.error || `选股请求失败 (${res.status})`);
+      } else if (res.body && res.body.getReader) {
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder("utf-8");
+        let buf = "";
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buf += decoder.decode(value, { stream: true });
+          const lines = buf.split("\n");
+          buf = lines.pop() || "";
+          for (const line of lines) {
+            const trimmed = line.trim();
+            if (!trimmed) continue;
+            const msg = JSON.parse(trimmed);
+            if (msg.type === "progress") {
+              updateScanProgress(msg.pct, msg.detail, msg.scanned || 0, msg.total || 0, msg.hits || 0);
+            } else if (msg.type === "error") {
+              throw new Error(msg.error || "选股失败");
+            } else if (msg.type === "result") {
+              data = msg.data;
+            }
+          }
+        }
+        if (buf.trim()) {
+          const msg = JSON.parse(buf.trim());
+          if (msg.type === "error") throw new Error(msg.error || "选股失败");
+          if (msg.type === "result") data = msg.data;
+        }
+      } else {
+        // Fallback for environments without ReadableStream
+        data = await apiJson("/api/screen", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+      }
+
+      if (!data) throw new Error("未收到选股结果");
+      updateScanProgress(100, "扫描完成，正在渲染榜单与 K 线…", data.stats?.ready || 0, data.stats?.ready || 0, data.stats?.hit_count || 0);
 
       state.signals = data.signals || [];
       state.aggregated = data.aggregated || [];
@@ -729,10 +803,13 @@
     } catch (err) {
       showToast(err.message, true);
     } finally {
+      clearInterval(elapsedTimer);
       btn.disabled = false;
       emptyBtn.disabled = false;
       $("screenSpinner").classList.add("hidden");
       $("screenBtnText").textContent = "开始选股";
+      $("screenOverlay").classList.add("hidden");
+      $("scanTopline").classList.add("hidden");
     }
   }
 

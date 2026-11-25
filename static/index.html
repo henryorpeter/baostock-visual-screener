@@ -4,9 +4,9 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>KLineRadar · A股选股与看盘终端</title>
-  <link rel="stylesheet" href="/static/app.css?v=4" />
+  <link rel="stylesheet" href="/static/app.css?v=5" />
   <script src="/static/lightweight-charts.standalone.production.js" defer></script>
-  <script src="/static/app.js?v=4" defer></script>
+  <script src="/static/app.js?v=5" defer></script>
 </head>
 <body>
   <!-- ==================== TOP BAR ==================== -->
@@ -160,10 +160,33 @@
       </div>
     </section>
 
+    <!-- Top thin progress track while scanning -->
+    <div class="scan-topline hidden" id="scanTopline">
+      <div class="scan-topline-fill" id="scanToplineFill"></div>
+    </div>
+
     <!-- Main Split Workspace -->
     <div class="workspace">
       <!-- Left: Empty Placeholder OR Native Multi-Pane K-line Terminal -->
       <section class="left-stage">
+        <!-- Real-time Screening Progress Modal Overlay -->
+        <div class="screen-overlay hidden" id="screenOverlay" role="status" aria-live="polite">
+          <div class="screen-modal">
+            <div class="screen-modal-head">
+              <span class="screen-ring"></span>
+              <span class="screen-modal-title">正在全市场选股</span>
+              <span class="screen-modal-pct mono" id="screenPct">0%</span>
+            </div>
+            <div class="screen-bar-track">
+              <div class="screen-bar-fill" id="screenBarFill" style="width: 0%"></div>
+            </div>
+            <div class="screen-modal-meta">
+              <span class="screen-detail" id="screenDetail">准备扫描全市场日线行情…</span>
+              <span class="screen-elapsed mono" id="screenElapsed">0.0s</span>
+            </div>
+            <div class="screen-modal-stats mono" id="screenLiveStats">已扫描 0 只 · 命中 0 条信号</div>
+          </div>
+        </div>
         <!-- Pre-Scan Placeholder (Instant startup, zero K-line overhead) -->
         <div class="empty-stage" id="emptyStage">
           <div class="empty-inner">

@@ -4,7 +4,9 @@
 启动：python web_server.py --port 8506
 """
 import argparse
+import asyncio
 from datetime import date, datetime, timedelta
+import json
 import math
 from pathlib import Path
 import threading
@@ -14,7 +16,7 @@ import webbrowser
 import numpy as np
 import pandas as pd
 from starlette.applications import Starlette
-from starlette.responses import FileResponse, JSONResponse, Response
+from starlette.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 import uvicorn
@@ -138,16 +140,25 @@ async def api_search(request):
     return JSONResponse({"items": (exact + prefix + contains)[:25]})
 
 
-async def api_screen(request):
-    body = await request.json()
+def _run_screen_core(body, emit=None):
+    """同步执行全市场选股核心逻辑；可选通过 emit(pct, detail, scanned, total, hits) 汇报实时进度。"""
+    def _report(pct, detail, scanned=0, total=0, hits=0):
+        if emit is not None:
+            emit({
+                "type": "progress",
+                "pct": max(0, min(100, int(round(pct)))),
+                "detail": detail,
+                "scanned": scanned,
+                "total": total,
+                "hits": hits,
+            })
+
     today_dt = date.today()
     start_str = str(body.get("start") or (today_dt - timedelta(days=180)).strftime("%Y-%m-%d"))[:10]
     end_str = str(body.get("end") or today_dt.strftime("%Y-%m-%d"))[:10]
     strategies = [s for s in (body.get("strategies") or []) if s in engine.STRATEGIES]
     if not strategies:
-        return JSONResponse({"error": "请至少选择 1 套选股策略"}, status_code=400)
-    if start_str >= end_str:
-        return JSONResponse({"error": "开始日期必须早于结束日期"}, status_code=400)
+        return None, ("请至少选择 1 套选股策略", 400)
 
     min_change = float(body.get("min_change", 0.0))
     max_turn = float(body.get("max_turn", 100.0))
@@ -159,7 +170,7 @@ async def api_screen(request):
     started = time.perf_counter()
     universe = _get_universe_cached()
     if not universe:
-        return JSONResponse({"error": "本地还没有股票列表，请先点击「同步行情」"}, status_code=400)
+        return None, ("本地还没有股票列表，请先点击「同步行情」", 400)
 
     limit = min(max_stocks, len(universe))
     stride = max(1, len(universe) // limit)
@@ -169,21 +180,28 @@ async def api_screen(request):
         start_dt = pd.Timestamp(start_str).date()
         end_dt = pd.Timestamp(end_str).date()
     except (ValueError, TypeError):
-        return JSONResponse({"error": "日期格式无效，请使用 YYYY-MM-DD"}, status_code=400)
+        return None, ("日期格式无效，请使用 YYYY-MM-DD", 400)
     if start_dt >= end_dt:
-        return JSONResponse({"error": "开始日期必须早于结束日期"}, status_code=400)
+        return None, ("开始日期必须早于结束日期", 400)
+
+    _report(10, f"正在加载本地行情缓存（{len(selected):,} 只股票）…", 0, len(selected), 0)
     lookback_start = min(start_dt, end_dt - timedelta(days=210))
     db_rows, db_newest, db_rev = db._cache_version()
     frames = engine.load_market_arrays(
         lookback_start.strftime("%Y-%m-%d"), end_str, db_rows, db_newest, db_rev
     )
     if not frames:
-        return JSONResponse({"error": "本地没有所选日期区间的行情缓存，请先同步行情"}, status_code=400)
+        return None, ("本地没有所选日期区间的行情缓存，请先同步行情", 400)
+
+    _report(22, f"缓存加载完成，开始扫描 {len(selected):,} 只股票（{len(strategies)} 套策略）…", 0, len(selected), 0)
+
+    def _on_progress(pct_frac, _stage=2, detail="", hits=0, scanned=0, total=0):
+        _report(pct_frac * 100.0, detail or "正在扫描策略…", scanned=scanned, total=total, hits=hits)
 
     result_df, scan_stats = engine.screen(
         selected, frames, strategies,
         min_change=min_change, min_turn=0.0, max_turn=max_turn,
-        on_progress=lambda *a, **k: None,
+        on_progress=_on_progress,
         window_start=start_str,
         exclude_st=exclude_st, exclude_gem_star=exclude_gem_star, min_amount=min_amount,
     )
@@ -229,6 +247,7 @@ async def api_screen(request):
         aggregated.sort(key=lambda x: (x["count"], x["pctChg"] if x["pctChg"] is not None else -999.0), reverse=True)
 
         if db_newest and end_str < db_newest:
+            _report(97, "正在计算历史 5 / 10 日胜率速验…", len(selected), len(selected), len(signals))
             fwd_df = engine.compute_forward_returns(result_df, end_str)
             if not fwd_df.empty:
                 for _, r in fwd_df.iterrows():
@@ -244,7 +263,7 @@ async def api_screen(request):
     avg_chg = _clean_num(result_df["涨跌幅%"].mean(), 2) if not result_df.empty else None
     limit_up = int((result_df["涨跌幅%"] >= 9.5).sum()) if not result_df.empty else 0
 
-    return JSONResponse({
+    return {
         "signals": signals,
         "aggregated": aggregated,
         "hit_strategies": hit_strategies,
@@ -259,7 +278,52 @@ async def api_screen(request):
             "limit_up": limit_up,
             "newest": db_newest,
         },
-    })
+    }, None
+
+
+async def api_screen(request):
+    body = await request.json()
+    data, err = await asyncio.to_thread(_run_screen_core, body)
+    if err is not None:
+        return JSONResponse({"error": err[0]}, status_code=err[1])
+    return JSONResponse(data)
+
+
+async def api_screen_stream(request):
+    """流式 NDJSON 选股接口，实时推送扫描进度与最终信号榜单。"""
+    body = await request.json()
+    loop = asyncio.get_running_loop()
+    queue = asyncio.Queue()
+
+    def _emit(payload):
+        loop.call_soon_threadsafe(queue.put_nowait, payload)
+
+    def _worker():
+        try:
+            data, err = _run_screen_core(body, emit=_emit)
+            if err is not None:
+                _emit({"type": "error", "error": err[0], "status": err[1]})
+            else:
+                _emit({"type": "result", "data": data})
+        except Exception as exc:
+            _emit({"type": "error", "error": str(exc), "status": 500})
+        finally:
+            loop.call_soon_threadsafe(queue.put_nowait, None)
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+    async def _gen():
+        while True:
+            item = await queue.get()
+            if item is None:
+                break
+            yield (json.dumps(item, ensure_ascii=False) + "\n").encode("utf-8")
+
+    return StreamingResponse(
+        _gen(),
+        media_type="application/x-ndjson",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 async def api_kline(request):
@@ -449,6 +513,7 @@ routes = [
     Route("/api/bootstrap", api_bootstrap),
     Route("/api/search", api_search),
     Route("/api/screen", api_screen, methods=["POST"]),
+    Route("/api/screen/stream", api_screen_stream, methods=["POST"]),
     Route("/api/kline/{code:path}", api_kline),
     Route("/api/watchlist", api_watchlist_list, methods=["GET"]),
     Route("/api/watchlist", api_watchlist_add, methods=["POST"]),
