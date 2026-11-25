@@ -195,7 +195,7 @@ def _run_screen_core(body, emit=None):
 
     _report(22, f"缓存加载完成，开始扫描 {len(selected):,} 只股票（{len(strategies)} 套策略）…", 0, len(selected), 0)
 
-    def _on_progress(pct_frac, _stage=2, detail="", hits=0, scanned=0, total=0):
+    def _on_progress(pct_frac, stage=2, detail="", hits=0, scanned=0, total=0, **_extra):
         _report(pct_frac * 100.0, detail or "正在扫描策略…", scanned=scanned, total=total, hits=hits)
 
     result_df, scan_stats = engine.screen(
