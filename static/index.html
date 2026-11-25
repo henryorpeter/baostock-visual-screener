@@ -4,9 +4,9 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>KLineRadar · A股选股与看盘终端</title>
-  <link rel="stylesheet" href="/static/app.css?v=5" />
+  <link rel="stylesheet" href="/static/app.css?v=6" />
   <script src="/static/lightweight-charts.standalone.production.js" defer></script>
-  <script src="/static/app.js?v=5" defer></script>
+  <script src="/static/app.js?v=6" defer></script>
 </head>
 <body>
   <!-- ==================== TOP BAR ==================== -->
@@ -268,7 +268,10 @@
               <div class="tb-chips" id="subChips"></div>
             </div>
 
-            <button class="tb-reset" id="btnResetZoom" type="button" title="自适应缩放视图">重置</button>
+            <div class="tb-end">
+              <span class="tb-range-meta mono" id="chartRangeMeta" title="滚轮缩放或向左拖动可查看全部历史"></span>
+              <button class="tb-reset" id="btnResetZoom" type="button" title="自适应查看全部历史 K 线">全景</button>
+            </div>
           </div>
 
           <!-- Live Crosshair OHLCV + Main Overlay Legend -->

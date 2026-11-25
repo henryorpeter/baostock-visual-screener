@@ -1,4 +1,5 @@
 """全市场行情同步引擎：交易日预检、腾讯批量截面、东财/腾讯/新浪三级并发回补、Baostock 兜底与收盘自动调度。"""
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
 import json
@@ -94,17 +95,17 @@ def _query(fn):
     )
 
 
-def _https_json(url, params, referer):
+def _https_json(url, params, referer, timeout=12, retries=3):
     error = None
     session = _http_session()
-    for attempt in range(3):
+    for attempt in range(retries):
         try:
-            response = session.get(url, params=params, headers={"Referer": referer}, timeout=12)
+            response = session.get(url, params=params, headers={"Referer": referer}, timeout=timeout)
             response.raise_for_status()
             return response.json()
         except (requests.RequestException, ValueError) as exc:
             error = exc
-            if attempt < 2:
+            if attempt < retries - 1:
                 time.sleep(0.6 * (attempt + 1))
     raise RuntimeError(f"HTTPS 行情备用源请求失败：{error}")
 
@@ -280,6 +281,80 @@ def _history_http(code, start, end, name=""):
     frame["amount"] = frame["close"] * frame["volume"]
     frame["date"] = pd.to_datetime(frame["date"])
     return frame.dropna(subset=["close"]).sort_values("date")
+
+
+_KLINE_EXT_LOCK = threading.Lock()
+_KLINE_EXT_CACHE = OrderedDict()
+_KLINE_EXT_OFFLINE_UNTIL = 0.0
+_KLINE_EXT_TTL = 900.0  # 15 分钟内存缓存
+_KLINE_PERIOD_MAP = {
+    "日线": ("day", 800),    # 腾讯 fqkline 上限约 800 根（约 3.3 年日线；>800 会被服务端回退到 640）
+    "周线": ("week", 520),   # 约 10 年周线
+    "月线": ("month", 240),  # 约 20 年月线
+}
+
+
+def fetch_kline_history(code, interval="日线", end_str=None):
+    """按需拉取单只股票多年期前复权日线/周线/月线（腾讯 fqkline），断网或失败返回 None 回退本地 SQLite。"""
+    global _KLINE_EXT_OFFLINE_UNTIL
+    if not code or "." not in code:
+        return None
+    market, symbol = code.split(".", 1)
+    if market not in ("sh", "sz") or interval not in _KLINE_PERIOD_MAP:
+        return None
+
+    now = time.monotonic()
+    period_key, count = _KLINE_PERIOD_MAP[interval]
+    cache_key = (code, interval)
+    with _KLINE_EXT_LOCK:
+        cached = _KLINE_EXT_CACHE.get(cache_key)
+        if cached is not None and (now - cached[0]) < _KLINE_EXT_TTL:
+            _KLINE_EXT_CACHE.move_to_end(cache_key)
+            base_df = cached[1]
+        elif now < _KLINE_EXT_OFFLINE_UNTIL:
+            return None
+        else:
+            base_df = None
+
+    if base_df is None:
+        sym = f"{market}{symbol}"
+        try:
+            payload = _https_json(
+                "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get",
+                {"param": f"{sym},{period_key},,,{count},qfq"},
+                "https://gu.qq.com/",
+                timeout=4,
+                retries=1,
+            )
+            node = (payload.get("data") or {}).get(sym) or {}
+            raw_rows = node.get(f"qfq{period_key}") or node.get(period_key) or []
+            rows = [r[:6] for r in raw_rows if len(r) >= 6]
+            if not rows:
+                return None
+            df = pd.DataFrame(rows, columns=["date", "open", "close", "high", "low", "volume"])
+            for col in ("open", "high", "low", "close", "volume"):
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+            if not symbol.startswith(("688", "689")):
+                df["volume"] = df["volume"] * 100.0
+            df["date"] = pd.to_datetime(df["date"], errors="coerce")
+            df = df.dropna(subset=["date", "open", "high", "low", "close"]).sort_values("date").reset_index(drop=True)
+            if df.empty:
+                return None
+            base_df = df
+            with _KLINE_EXT_LOCK:
+                _KLINE_EXT_CACHE[cache_key] = (now, base_df)
+                _KLINE_EXT_CACHE.move_to_end(cache_key)
+                while len(_KLINE_EXT_CACHE) > 128:
+                    _KLINE_EXT_CACHE.popitem(last=False)
+        except Exception:
+            with _KLINE_EXT_LOCK:
+                _KLINE_EXT_OFFLINE_UNTIL = time.monotonic() + 60.0
+            return None
+
+    out = base_df
+    if end_str:
+        out = out[out["date"] <= pd.Timestamp(end_str)].reset_index(drop=True)
+    return out if not out.empty else None
 
 
 def _history_eastmoney(code, start, end, name=""):

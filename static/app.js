@@ -1207,6 +1207,16 @@
     $("subpaneLegends").innerHTML = "";
 
     const bars = data.bars || [];
+    const metaEl = $("chartRangeMeta");
+    if (metaEl) {
+      if (bars.length > 0) {
+        const d0 = bars[0].time.slice(0, 7);
+        const d1 = bars[bars.length - 1].time.slice(0, 7);
+        metaEl.textContent = `${bars.length} 根 · ${d0}~${d1}`;
+      } else {
+        metaEl.textContent = "";
+      }
+    }
     if (!bars.length || typeof LightweightCharts === "undefined") return;
 
     state.barByTime.clear();
@@ -1416,9 +1426,10 @@
     state.paneSubMap = paneSubMap;
     applyPaneHeights(totalH);
 
-    // Default visible window (last ~90 bars for clean candle readability)
-    if (bars.length > 95) {
-      chart.timeScale().setVisibleLogicalRange({ from: bars.length - 95, to: bars.length + 4 });
+    // Default visible window: 日线/周线默认展示近 110 根（左拖或滚轮可看全部多年历史），月线直接展示近 120 月/全景
+    const defaultSpan = state.interval === "月线" ? 140 : 110;
+    if (bars.length > defaultSpan + 5) {
+      chart.timeScale().setVisibleLogicalRange({ from: bars.length - defaultSpan, to: bars.length + 4 });
     } else {
       chart.timeScale().fitContent();
     }

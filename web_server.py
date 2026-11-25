@@ -332,36 +332,46 @@ async def api_kline(request):
     if interval not in ("日线", "周线", "月线"):
         interval = "日线"
     today_dt = date.today()
-    start_str = request.query_params.get("start") or (today_dt - timedelta(days=180)).strftime("%Y-%m-%d")
     end_str = request.query_params.get("end") or today_dt.strftime("%Y-%m-%d")
 
-    if interval in ("周线", "月线"):
-        fetch_start = "1990-01-01"
-        display_start = None
-    else:
-        fetch_start = (pd.Timestamp(start_str) - pd.Timedelta(days=180)).strftime("%Y-%m-%d")
-        display_start = start_str
+    # 1. 本地日线（用于顶部精准换手率/成交额卡片，以及离线兜底）
+    local_frame = db._cache_read(code, "1990-01-01", end_str)
 
-    frame = db._cache_read(code, fetch_start, end_str)
-    if frame.empty:
-        return JSONResponse({"error": f"本地暂无 {code} 在该区间的日线缓存"}, status_code=404)
+    # 2. 按需拉取单股多年期前复权日线/周线/月线（4年日线 / 10年周线 / 20年月线），失败自动回退本地库
+    ext_frame = await asyncio.to_thread(sync.fetch_kline_history, code, interval, end_str)
+
+    use_ext = False
+    if ext_frame is not None and not ext_frame.empty:
+        if interval in ("周线", "月线"):
+            use_ext = True
+        elif local_frame.empty or len(ext_frame) > len(local_frame):
+            use_ext = True
+
+    if not use_ext and local_frame.empty:
+        return JSONResponse({"error": f"本地暂无 {code} 在该区间的行情数据"}, status_code=404)
 
     # 名称查询
     name_map = dict(_get_universe_cached())
     name = name_map.get(code, code)
 
-    # 最新日行情卡片摘要（基于原始日线）
-    latest = frame.iloc[-1]
-    prior = frame.iloc[-2].close if len(frame) > 1 else latest.close
+    # 最新日行情卡片摘要（优先用本地日线以保留准确换手率与成交额，无本地则用在线末根兜底）
+    ticker_src = local_frame if not local_frame.empty else ext_frame
+    latest = ticker_src.iloc[-1]
+    prior = ticker_src.iloc[-2].close if len(ticker_src) > 1 else latest.close
     change = (float(latest.close) / float(prior) - 1.0) * 100.0 if prior else 0.0
     amp = ((float(latest.high) - float(latest.low)) / float(prior) * 100.0) if prior else 0.0
+    latest_turn = getattr(latest, "turn", None)
+    latest_amt = getattr(latest, "amount", None)
+    if latest_amt is None or (isinstance(latest_amt, float) and math.isnan(latest_amt)):
+        latest_amt = float(latest.close) * float(latest.volume)
 
-    # 全套 14 项指标（复用 charts._resample_kline）
-    kdf = charts._resample_kline(frame, interval)
-    if display_start is not None and not kdf.empty:
-        sliced = kdf[kdf["date"] >= pd.Timestamp(display_start)].reset_index(drop=True)
-        if not sliced.empty:
-            kdf = sliced
+    # 全套 14 项指标（不按 180 天截断，保留完整多年历史供左拖/缩放与长周期均线/布林带计算）
+    if use_ext:
+        kdf = charts._resample_kline(ext_frame, interval, already_resampled=True)
+        history_source = "extended"
+    else:
+        kdf = charts._resample_kline(local_frame, interval, already_resampled=False)
+        history_source = "local"
 
     cols_to_export = [
         "time", "open", "high", "low", "close", "volume",
@@ -402,6 +412,8 @@ async def api_kline(request):
         "code": code,
         "name": name,
         "interval": interval,
+        "history_source": history_source,
+        "bar_count": len(bars),
         "in_watchlist": code in wl_codes,
         "ticker": {
             "date": pd.Timestamp(latest.date).strftime("%Y-%m-%d"),
@@ -411,9 +423,9 @@ async def api_kline(request):
             "close": _clean_num(latest.close, 2),
             "pctChg": _clean_num(change, 2),
             "amp": _clean_num(amp, 2),
-            "turn": _clean_num(latest.turn, 2),
-            "amount": _clean_num(latest.amount, 0),
-            "amount_str": charts._fmt_amount(latest.amount),
+            "turn": _clean_num(latest_turn, 2),
+            "amount": _clean_num(latest_amt, 0),
+            "amount_str": charts._fmt_amount(latest_amt),
             "volume_str": charts._fmt_volume(latest.volume),
             "rsi6": last_bar.get("rsi6"),
             "macd_trend": macd_trend,

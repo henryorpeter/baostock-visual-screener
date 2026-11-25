@@ -1272,8 +1272,20 @@ body {
   font-weight: 600;
 }
 
-.tb-reset {
+.tb-end {
   margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.tb-range-meta {
+  font-size: 10.5px;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.tb-reset {
   height: 22px;
   padding: 0 8px;
   border: 1px solid var(--border);

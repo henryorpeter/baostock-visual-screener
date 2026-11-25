@@ -330,9 +330,12 @@ def _asgi_call(app, method, path, query_string="", json_body=None):
     return status_code, resp_headers, body_bytes
 
 
-def test_web_server_api_end_to_end(isolated_db):
+def test_web_server_api_end_to_end(isolated_db, monkeypatch):
     import json
     import web_server
+
+    # 离线确定性测试：禁用外网拉取，验证本地 SQLite 回退与全部端点
+    monkeypatch.setattr(sync, "fetch_kline_history", lambda *a, **k: None)
 
     df = _make_ohlcv(n=130, seed=17, trend=0.002, code="sh.600519")
     df.iloc[-1, df.columns.get_loc("open")] = df["close"].iloc[-2] * 1.01
@@ -418,6 +421,40 @@ def test_web_server_api_end_to_end(isolated_db):
 
     st, hdrs, ebk = _asgi_call(web_server.web_app, "POST", "/api/export", json_body={"format": "ebk", "codes": ["sh.600519"]})
     assert st == 200 and ebk == b"1600519\r\n" and ".ebk" in hdrs.get("content-disposition", "")
+
+
+def test_extended_multi_year_kline_history_and_resample(isolated_db, monkeypatch):
+    import json
+    import web_server
+
+    # 构造本地仅 30 根日线，但模拟腾讯 fqkline 返回 120 根周线（跨 2+ 年），验证 api_kline 自动采用多年周线并正确算出 MA20/BOLL
+    df_local = _make_ohlcv(n=30, seed=9, code="sh.600519")
+    db._cache_write(df_local)
+    db.cache_universe_save(pd.DataFrame([{"code": "sh.600519", "code_name": "贵州茅台"}]))
+    web_server._get_universe_cached(force=True)
+
+    weekly_dates = pd.date_range("2024-01-05", periods=120, freq="W-FRI")
+    mock_rows = [
+        [d.strftime("%Y-%m-%d"), f"{100 + i * 0.2:.2f}", f"{101 + i * 0.2:.2f}", f"{102 + i * 0.2:.2f}", f"{99 + i * 0.2:.2f}", "5000"]
+        for i, d in enumerate(weekly_dates)
+    ]
+    sync._KLINE_EXT_CACHE.clear()
+    sync._KLINE_EXT_OFFLINE_UNTIL = 0.0
+    monkeypatch.setattr(
+        sync,
+        "_https_json",
+        lambda url, params, referer, timeout=12, retries=3: {"data": {"sh600519": {"qfqweek": mock_rows}}},
+    )
+
+    from urllib.parse import urlencode
+    cutoff = weekly_dates[99].strftime("%Y-%m-%d")
+    st, _, raw = _asgi_call(web_server.web_app, "GET", "/api/kline/sh.600519", urlencode({"interval": "周线", "end": cutoff}))
+    assert st == 200
+    kl = json.loads(raw)
+    assert kl["history_source"] == "extended"
+    assert kl["bar_count"] == 100 and len(kl["bars"]) == 100
+    assert kl["bars"][-1]["volume"] == 500000  # 非科创板手转股 ×100
+    assert kl["bars"][-1]["boll_up"] is not None and kl["bars"][-1]["ema60"] is not None
 
 
 # ==================== 6. Legacy AppTest E2E smoke tests ====================

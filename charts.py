@@ -87,10 +87,12 @@ def _rsi_series(close, window):
     return rsi
 
 
-def _resample_kline(frame, interval):
+def _resample_kline(frame, interval, already_resampled=False):
     d = frame.copy().sort_values("date").dropna(subset=["open", "high", "low", "close"])
     d["volume"] = pd.to_numeric(d.volume, errors="coerce").fillna(0)
-    if interval == "周线":
+    if already_resampled:
+        period = None
+    elif interval == "周线":
         period = d.date.dt.to_period("W-FRI")
     elif interval == "月线":
         period = d.date.dt.to_period("M")
