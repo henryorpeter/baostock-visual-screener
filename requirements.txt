@@ -1,7 +1,9 @@
 baostock>=0.9.4
 numpy>=1.24
 pandas>=2.0
+requests>=2.31
+starlette>=0.37
+uvicorn>=0.29
+streamlit>=1.30
 streamlit-lightweight-charts-v5>=0.2.0
 streamlit-antd-components>=0.3.2
-streamlit>=1.30
-requests>=2.31
