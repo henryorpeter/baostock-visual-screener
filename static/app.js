@@ -43,6 +43,7 @@
     interval: "日线",
     overlays: new Set(["MA"]),
     subs: new Set(["VOL", "MACD"]),
+    compactSubs: false,
     klineData: null,
     barByTime: new Map(),
     prevCloseByTime: new Map(),
@@ -370,6 +371,36 @@
 
     $("btnResetZoom").addEventListener("click", () => {
       if (state.chart) state.chart.timeScale().fitContent();
+    });
+
+    $("btnToggleSubLayout").addEventListener("click", () => {
+      state.compactSubs = !state.compactSubs;
+      if (state.klineData) renderChart(state.klineData);
+    });
+
+    // 多副图溢出时，捕获垂直滚轮直接滚动容器（防止 TradingView 劫持滚轮缩放导致拉不下来）；Ctrl+滚轮仍可缩放 K 线
+    $("chartScrollWrap").addEventListener(
+      "wheel",
+      (e) => {
+        const wrap = $("chartScrollWrap");
+        const canScrollY = wrap.scrollHeight > wrap.clientHeight + 2;
+        if (canScrollY && !e.ctrlKey && !e.metaKey && Math.abs(e.deltaY) >= Math.abs(e.deltaX)) {
+          e.stopPropagation();
+        }
+      },
+      { capture: true, passive: true }
+    );
+
+    // 副图左上角角标上的「×」可直接关闭单个副图
+    $("subpaneLegends").addEventListener("click", (e) => {
+      const btn = e.target.closest(".pane-close-btn");
+      if (!btn) return;
+      const key = btn.dataset.closeSub;
+      if (!key || !state.subs.has(key)) return;
+      state.subs.delete(key);
+      const chip = $("subChips").querySelector(`.ind-chip[data-sub="${CSS.escape(key)}"]`);
+      if (chip) chip.classList.remove("active");
+      if (state.klineData) renderChart(state.klineData);
     });
 
     // Watchlist star in ticker strip
@@ -1236,9 +1267,9 @@
     const subCount = activeSubs.length;
 
     const wrapH = Math.max(280, scrollWrap.clientHeight);
-    const minNeededH = 260 + subCount * 90;
-    const totalH = Math.max(wrapH, minNeededH);
+    const totalH = calcChartTotalHeight(wrapH, subCount);
     mount.style.height = totalH + "px";
+    updateSubLayoutUI(wrapH, totalH, subCount);
 
     const chart = LightweightCharts.createChart(mount, {
       autoSize: true,
@@ -1460,15 +1491,45 @@
     setTimeout(() => positionSubpaneLegends(state.paneSubMap), 80);
   }
 
+  function calcChartTotalHeight(wrapH, subCount) {
+    if (state.compactSubs || subCount <= 2) {
+      return wrapH;
+    }
+    // 3+ 副图展开模式：给主图 340px + 每个副图 108px，滚轮即可丝滑上下翻看
+    return Math.max(wrapH, 340 + subCount * 108);
+  }
+
+  function updateSubLayoutUI(wrapH, totalH, subCount) {
+    const toggleBtn = $("btnToggleSubLayout");
+    const hintEl = $("chartScrollHint");
+    const manySubs = subCount >= 3;
+    if (toggleBtn) {
+      toggleBtn.classList.toggle("hidden", !manySubs);
+      toggleBtn.classList.toggle("active", state.compactSubs);
+      toggleBtn.textContent = state.compactSubs ? "展开滚动" : "一屏全览";
+    }
+    if (hintEl) {
+      hintEl.classList.toggle("hidden", !(totalH > wrapH + 2));
+    }
+  }
+
   function applyPaneHeights(totalH) {
     if (!state.chart) return;
     const panes = state.chart.panes();
-    if (panes.length > 1) {
-      const subEach = Math.max(78, Math.min(108, Math.floor((totalH * 0.40) / (panes.length - 1))));
-      for (let i = 1; i < panes.length; i++) {
-        panes[i].setHeight(subEach);
-      }
+    const subCount = panes.length - 1;
+    if (subCount <= 0) return;
+
+    // LightweightCharts v5 的 setHeight 会把差值等比分配给其余所有 pane；
+    // 只需对主图 panes[0] 调用一次 setHeight(mainH)，即可让 1..N 全部副图获得 100% 均匀一致的高度！
+    let mainH;
+    if (state.compactSubs && subCount >= 3) {
+      mainH = Math.max(175, Math.floor(totalH * 0.36));
+    } else if (subCount >= 3) {
+      mainH = 340;
+    } else {
+      mainH = Math.floor(totalH * (subCount === 1 ? 0.74 : 0.58));
     }
+    panes[0].setHeight(mainH);
   }
 
   function resizeChart() {
@@ -1476,10 +1537,12 @@
     const scrollWrap = $("chartScrollWrap");
     const mount = $("chartMount");
     const activeSubs = (state.bootstrap?.sub_indicators || []).filter((k) => state.subs.has(k));
-    const h = Math.max(scrollWrap.clientHeight, 260 + activeSubs.length * 90);
+    const wrapH = Math.max(280, scrollWrap.clientHeight);
+    const h = calcChartTotalHeight(wrapH, activeSubs.length);
     if (mount.style.height !== h + "px") {
       mount.style.height = h + "px";
     }
+    updateSubLayoutUI(wrapH, h, activeSubs.length);
     applyPaneHeights(h);
     requestAnimationFrame(() => positionSubpaneLegends(state.paneSubMap));
     setTimeout(() => positionSubpaneLegends(state.paneSubMap), 80);
@@ -1532,11 +1595,26 @@
     }
     $("crosshairLegend").innerHTML = parts.join("");
 
-    // Sub-pane floating legends
+    // Sub-pane floating legends: 复用稳定 DOM 节点与关闭按钮，十字光标移动时只更新数值，防止点击 × 丢焦点
     const host = $("subpaneLegends");
-    host.innerHTML = paneSubMap
-      .map(({ paneIdx, key }) => `<div class="pane-legend-badge" data-pane="${paneIdx}">${formatSubLegend(key, bar)}</div>`)
-      .join("");
+    const needRebuild =
+      host.children.length !== paneSubMap.length ||
+      paneSubMap.some(({ paneIdx, key }, idx) => {
+        const el = host.children[idx];
+        return !el || el.dataset.pane !== String(paneIdx) || el.dataset.key !== key;
+      });
+    if (needRebuild) {
+      host.innerHTML = paneSubMap
+        .map(
+          ({ paneIdx, key }) =>
+            `<div class="pane-legend-badge" data-pane="${paneIdx}" data-key="${escHtml(key)}"><button class="pane-close-btn" data-close-sub="${escHtml(key)}" type="button" title="关闭 ${escHtml(key)} 副图">×</button><span class="pane-legend-vals"></span></div>`
+        )
+        .join("");
+    }
+    for (let i = 0; i < paneSubMap.length; i++) {
+      const valSpan = host.children[i]?.querySelector(".pane-legend-vals");
+      if (valSpan) valSpan.innerHTML = formatSubLegend(paneSubMap[i].key, bar);
+    }
     positionSubpaneLegends(paneSubMap);
   }
 

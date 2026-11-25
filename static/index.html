@@ -4,9 +4,9 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>KLineRadar · A股选股与看盘终端</title>
-  <link rel="stylesheet" href="/static/app.css?v=9" />
+  <link rel="stylesheet" href="/static/app.css?v=12" />
   <script src="/static/lightweight-charts.standalone.production.js" defer></script>
-  <script src="/static/app.js?v=9" defer></script>
+  <script src="/static/app.js?v=12" defer></script>
 </head>
 <body>
   <!-- ==================== TOP BAR ==================== -->
@@ -269,7 +269,9 @@
             </div>
 
             <div class="tb-end">
-              <span class="tb-range-meta mono" id="chartRangeMeta" title="滚轮缩放或向左拖动可查看全部历史"></span>
+              <span class="tb-scroll-hint hidden" id="chartScrollHint">滚轮上下 · Ctrl+滚轮缩放</span>
+              <span class="tb-range-meta mono" id="chartRangeMeta" title="向左拖动或缩放可查看全部历史"></span>
+              <button class="tb-reset hidden" id="btnToggleSubLayout" type="button" title="在「展开滚动」与「一屏全览」间切换多副图布局">一屏全览</button>
               <button class="tb-reset" id="btnResetZoom" type="button" title="自适应查看全部历史 K 线">全景</button>
             </div>
           </div>

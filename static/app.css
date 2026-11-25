@@ -1279,6 +1279,15 @@ body {
   gap: 8px;
 }
 
+.tb-scroll-hint {
+  font-size: 10.5px;
+  color: var(--up);
+  background: var(--up-soft);
+  padding: 1px 6px;
+  border-radius: 3px;
+  white-space: nowrap;
+}
+
 .tb-range-meta {
   font-size: 10.5px;
   color: var(--text-muted);
@@ -1294,6 +1303,13 @@ body {
   color: var(--text-muted);
   font-size: 11px;
   cursor: pointer;
+}
+
+.tb-reset.active {
+  border-color: var(--up-border);
+  background: var(--up-soft);
+  color: var(--up);
+  font-weight: 600;
 }
 
 .tb-reset:hover {
@@ -1336,6 +1352,16 @@ body {
   overflow-y: auto;
   overflow-x: hidden;
   background: var(--bg-panel);
+  scrollbar-gutter: stable;
+}
+
+.chart-scroll-wrap::-webkit-scrollbar {
+  width: 9px;
+}
+
+.chart-scroll-wrap::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border-radius: 4px;
 }
 
 .chart-canvas-host {
@@ -1359,11 +1385,33 @@ body {
   gap: 8px;
   padding: 1px 6px;
   border-radius: 3px;
-  background: rgba(19, 23, 34, 0.72);
+  background: rgba(19, 23, 34, 0.78);
   font-size: 10.5px;
   font-family: "JetBrains Mono", Consolas, monospace;
   color: var(--text-secondary);
   white-space: nowrap;
+}
+
+.pane-legend-vals {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.pane-close-btn {
+  pointer-events: auto;
+  border: 0;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1;
+  padding: 0 2px;
+  margin-right: 2px;
+  cursor: pointer;
+}
+
+.pane-close-btn:hover {
+  color: var(--up);
 }
 
 [data-theme="light"] .pane-legend-badge {
