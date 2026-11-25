@@ -276,15 +276,23 @@ def test_sync_recent_trade_days_and_auto_sync_schedule(isolated_db, monkeypatch)
 
 # ==================== 5. Web API (Starlette ASGI) tests ====================
 
-def _asgi_call(app, method, path, query_string="", json_body=None):
+def _asgi_call(app, method, path, query_string="", json_body=None, raw_bytes=None, extra_headers=None):
     """零外部依赖（无需 httpx）的轻量 Starlette ASGI 直接调用器。"""
     import asyncio
     import json
 
-    raw_body = json.dumps(json_body).encode("utf-8") if json_body is not None else b""
+    if raw_bytes is not None:
+        raw_body = raw_bytes
+    elif json_body is not None:
+        raw_body = json.dumps(json_body).encode("utf-8")
+    else:
+        raw_body = b""
     headers = [(b"host", b"testserver")]
     if json_body is not None:
         headers.append((b"content-type", b"application/json"))
+    if extra_headers:
+        for k, v in extra_headers.items():
+            headers.append((k.lower().encode("latin1"), v.encode("latin1")))
     scope = {
         "type": "http",
         "asgi": {"version": "3.0"},
@@ -455,6 +463,74 @@ def test_extended_multi_year_kline_history_and_resample(isolated_db, monkeypatch
     assert kl["bar_count"] == 100 and len(kl["bars"]) == 100
     assert kl["bars"][-1]["volume"] == 500000  # 非科创板手转股 ×100
     assert kl["bars"][-1]["boll_up"] is not None and kl["bars"][-1]["ema60"] is not None
+
+
+def test_web_server_security_hardening(isolated_db):
+    import json
+    import web_server
+
+    # 1. 安全响应头检查
+    st, hdrs, _ = _asgi_call(web_server.web_app, "GET", "/")
+    assert st == 200
+    assert hdrs.get("x-content-type-options") == "nosniff"
+    assert hdrs.get("x-frame-options") == "DENY"
+    assert "script-src 'self'" in hdrs.get("content-security-policy", "")
+
+    # 2. 异源 / 跨站 CSRF 拦截，同源放行
+    st, _, _ = _asgi_call(
+        web_server.web_app, "POST", "/api/watchlist",
+        json_body={"code": "sh.600519", "name": "贵州茅台"},
+        extra_headers={"Origin": "https://evil.example"},
+    )
+    assert st == 403
+    st, _, _ = _asgi_call(
+        web_server.web_app, "POST", "/api/watchlist",
+        json_body={"code": "sh.600519", "name": "贵州茅台"},
+        extra_headers={"Sec-Fetch-Site": "cross-site"},
+    )
+    assert st == 403
+    st, _, _ = _asgi_call(
+        web_server.web_app, "POST", "/api/watchlist",
+        json_body={"code": "sh.600519", "name": "贵州茅台"},
+        extra_headers={"Origin": "http://testserver"},
+    )
+    assert st == 200
+
+    # 3. 股票代码注入 / 非法日期 / 畸形 JSON / NaN 数值全部返回 400 而非 500
+    st, _, _ = _asgi_call(web_server.web_app, "GET", "/api/kline/sh.600519,day,,,999999")
+    assert st == 400
+    st, _, _ = _asgi_call(web_server.web_app, "GET", "/api/kline/sh.600519", "end=not-a-date")
+    assert st == 400
+    st, _, _ = _asgi_call(web_server.web_app, "POST", "/api/watchlist", json_body={"code": "../evil"})
+    assert st == 400
+    st, _, _ = _asgi_call(web_server.web_app, "POST", "/api/screen", raw_bytes=b"{broken json")
+    assert st == 400
+    st, _, _ = _asgi_call(
+        web_server.web_app, "POST", "/api/screen",
+        json_body={"strategies": ["海龟突破策略"], "min_change": "NaN"},
+    )
+    assert st == 400
+    st, _, _ = _asgi_call(web_server.web_app, "POST", "/api/sync/config", json_body={"enabled": True, "sync_time": "99:99"})
+    assert st == 400
+    assert sync.fetch_kline_history("sh.600519,day,,,999", "日线") is None
+
+    # 4. CSV 公式注入中和（= / + / - / @ 前加单引号）
+    st, _, csv_bytes = _asgi_call(
+        web_server.web_app, "POST", "/api/export",
+        json_body={
+            "format": "csv",
+            "signals": [
+                {"strategy": "=CMD|' /C calc'!A0", "code": "sh.600519", "name": "@SUM(1+1)", "reason": "+evil"},
+            ],
+        },
+    )
+    assert st == 200
+    csv_text = csv_bytes.decode("utf-8-sig")
+    assert "'=CMD" in csv_text and "'@SUM" in csv_text and "'+evil" in csv_text
+
+    # 5. Server酱 SendKey 路径注入校验
+    with pytest.raises(ValueError):
+        engine.push_wechat(pd.DataFrame([{"代码": "sh.600519", "名称": "A", "收盘": 10.0, "涨跌幅%": 1.0}]), "../../evil?x=1", ["测试"])
 
 
 # ==================== 6. Legacy AppTest E2E smoke tests ====================

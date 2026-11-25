@@ -24,6 +24,7 @@ _STATUS_CACHE = {"ts": 0.0, "data": None}
 def connect(timeout=30):
     conn = sqlite3.connect(CACHE_DB, timeout=timeout)
     try:
+        conn.execute(f"PRAGMA busy_timeout={int(max(1, timeout) * 1000)}")
         with conn:
             yield conn
     finally:

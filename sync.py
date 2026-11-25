@@ -20,6 +20,7 @@ import db
 
 BAOSTOCK_AVAILABLE = None
 SYNC_LOCK = threading.Lock()
+_BAOSTOCK_LOCK = threading.Lock()
 _THREAD_LOCAL = threading.local()
 
 
@@ -61,34 +62,35 @@ def _query(fn):
             "Baostock 服务不可达（public-api.baostock.com:10030 连接超时），已自动跳过。"
         )
     last = None
-    prev_timeout = socket.getdefaulttimeout()
-    socket.setdefaulttimeout(10.0)
-    try:
-        for attempt in range(2):
-            try:
-                login = bs.login()
-            except Exception as exc:
-                last = type("Err", (), {"error_code": "timeout", "error_msg": str(exc)})()
-                login = None
-            if login is not None and login.error_code == "0":
-                BAOSTOCK_AVAILABLE = True
+    with _BAOSTOCK_LOCK:
+        prev_timeout = socket.getdefaulttimeout()
+        socket.setdefaulttimeout(10.0)
+        try:
+            for attempt in range(2):
                 try:
-                    return fn()
-                finally:
+                    login = bs.login()
+                except Exception as exc:
+                    last = type("Err", (), {"error_code": "timeout", "error_msg": str(exc)})()
+                    login = None
+                if login is not None and login.error_code == "0":
+                    BAOSTOCK_AVAILABLE = True
                     try:
-                        bs.logout()
-                    except Exception:
-                        pass
-            if login is not None:
-                last = login
-            try:
-                bs.logout()
-            except Exception:
-                pass
-            if attempt < 1:
-                time.sleep(1.0)
-    finally:
-        socket.setdefaulttimeout(prev_timeout)
+                        return fn()
+                    finally:
+                        try:
+                            bs.logout()
+                        except Exception:
+                            pass
+                if login is not None:
+                    last = login
+                try:
+                    bs.logout()
+                except Exception:
+                    pass
+                if attempt < 1:
+                    time.sleep(1.0)
+        finally:
+            socket.setdefaulttimeout(prev_timeout)
     raise RuntimeError(
         f"登录失败 {last.error_code}: {last.error_msg}。"
         "这是 Baostock 网络连接错误，请检查 public-api.baostock.com:10030 是否可访问后重试。"
@@ -297,10 +299,10 @@ _KLINE_PERIOD_MAP = {
 def fetch_kline_history(code, interval="日线", end_str=None):
     """按需拉取单只股票多年期前复权日线/周线/月线（腾讯 fqkline），断网或失败返回 None 回退本地 SQLite。"""
     global _KLINE_EXT_OFFLINE_UNTIL
-    if not code or "." not in code:
+    if not isinstance(code, str) or not re.fullmatch(r"(?:sh|sz)\.\d{6}", code):
         return None
     market, symbol = code.split(".", 1)
-    if market not in ("sh", "sz") or interval not in _KLINE_PERIOD_MAP:
+    if interval not in _KLINE_PERIOD_MAP:
         return None
 
     now = time.monotonic()

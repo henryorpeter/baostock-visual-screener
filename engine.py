@@ -636,15 +636,19 @@ def _format_plain_codes(codes):
 
 def push_wechat(result, sendkey, strategy_names):
     """通过 Server酱把结果推送到绑定的微信。"""
-    if not sendkey.strip():
+    import re
+    key = (sendkey or "").strip()
+    if not key:
         raise ValueError("请先填写 Server酱 SendKey")
+    if not re.fullmatch(r"[A-Za-z0-9_-]{8,128}", key):
+        raise ValueError("SendKey 格式无效，仅允许字母、数字、下划线或连字符")
     if result.empty:
         raise ValueError("当前没有可推送的选股结果")
     lines = [f"策略：{'、'.join(strategy_names)}", f"共 {len(result)} 条"]
     for _, row in result.head(50).iterrows():
         lines.append(f"{row['代码']} {row['名称']} 收盘 {row['收盘']:.2f} 涨跌 {row['涨跌幅%']:.2f}%")
     response = requests.post(
-        f"https://sctapi.ftqq.com/{sendkey.strip()}.send",
+        f"https://sctapi.ftqq.com/{key}.send",
         data={"title": f"Baostock选股 {date.today():%Y-%m-%d}", "desp": "\n".join(lines)},
         timeout=15,
     )

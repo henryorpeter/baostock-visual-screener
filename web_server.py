@@ -9,13 +9,17 @@ from datetime import date, datetime, timedelta
 import json
 import math
 from pathlib import Path
+import re
+import sys
 import threading
 import time
+from urllib.parse import urlparse
 import webbrowser
 
 import numpy as np
 import pandas as pd
 from starlette.applications import Starlette
+from starlette.middleware import Middleware
 from starlette.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
@@ -30,6 +34,85 @@ import sync
 STATIC_DIR = Path(__file__).with_name("static")
 _UNIVERSE_CACHE = {"ts": 0.0, "data": []}
 _UNIVERSE_LOCK = threading.Lock()
+_SCREEN_SEM = threading.BoundedSemaphore(2)
+_CODE_RE = re.compile(r"^(?:sh|sz|bj)\.\d{6}$")
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_CTRL_RE = re.compile(r"[\x00-\x1f\x7f]")
+_MAX_BODY_BYTES = 2 * 1024 * 1024  # 2 MB 请求体上限，防止大包内存耗尽
+_MAX_EXPORT_ROWS = 10000
+_MAX_WATCHLIST_SIZE = 500
+_CSP_HEADER = (
+    "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+    "img-src 'self' data: blob:; connect-src 'self'; frame-ancestors 'none'"
+)
+
+
+def _valid_code(code):
+    return isinstance(code, str) and bool(_CODE_RE.fullmatch(code))
+
+
+def _valid_date_str(s):
+    if not isinstance(s, str) or not _DATE_RE.fullmatch(s):
+        return False
+    try:
+        datetime.strptime(s, "%Y-%m-%d")
+        return True
+    except ValueError:
+        return False
+
+
+def _parse_finite_float(val, default, lo, hi, field_name):
+    if val is None or val == "":
+        return default, None
+    try:
+        f = float(val)
+    except (TypeError, ValueError):
+        return None, f"参数 {field_name} 必须是有效数字"
+    if not math.isfinite(f):
+        return None, f"参数 {field_name} 不能为 NaN 或无穷大"
+    return max(lo, min(hi, f)), None
+
+
+def _parse_bounded_int(val, default, lo, hi, field_name):
+    if val is None or val == "":
+        return default, None
+    try:
+        n = int(val)
+    except (TypeError, ValueError):
+        return None, f"参数 {field_name} 必须是整数"
+    return max(lo, min(hi, n)), None
+
+
+def _csv_safe_cell(val):
+    """中和 Excel/WPS CSV 公式注入（以 =/+/-/@/Tab/CR 开头的文本单元格加前置单引号）。"""
+    if val is None:
+        return ""
+    s = str(val)
+    if s and s[0] in ("=", "+", "-", "@", "\t", "\r"):
+        return "'" + s
+    return s
+
+
+async def _read_json_dict(request, max_bytes=_MAX_BODY_BYTES):
+    cl = request.headers.get("content-length")
+    if cl is not None:
+        try:
+            if int(cl) > max_bytes:
+                return None, ("请求体过大", 413)
+        except ValueError:
+            return None, ("无效的 Content-Length", 400)
+    raw = await request.body()
+    if len(raw) > max_bytes:
+        return None, ("请求体过大", 413)
+    if not raw:
+        return {}, None
+    try:
+        parsed = json.loads(raw)
+    except (ValueError, UnicodeDecodeError):
+        return None, ("请求 JSON 格式错误", 400)
+    if not isinstance(parsed, dict):
+        return None, ("请求体必须为 JSON 对象", 400)
+    return parsed, None
 
 
 def _clean_num(val, ndigits=None):
@@ -101,6 +184,7 @@ async def api_index(_request):
 
 async def api_bootstrap(_request):
     local_status = db.cache_status()
+    local_status["db_name"] = db.CACHE_DB.name
     mgr = sync.get_sync_manager_singleton()
     auto_state = mgr.snapshot(local_status=local_status)
     return JSONResponse({
@@ -156,16 +240,30 @@ def _run_screen_core(body, emit=None):
     today_dt = date.today()
     start_str = str(body.get("start") or (today_dt - timedelta(days=180)).strftime("%Y-%m-%d"))[:10]
     end_str = str(body.get("end") or today_dt.strftime("%Y-%m-%d"))[:10]
-    strategies = [s for s in (body.get("strategies") or []) if s in engine.STRATEGIES]
+    raw_strats = body.get("strategies")
+    if not isinstance(raw_strats, list):
+        return None, ("策略列表格式无效", 400)
+    strategies = [s for s in raw_strats if isinstance(s, str) and s in engine.STRATEGIES]
     if not strategies:
         return None, ("请至少选择 1 套选股策略", 400)
 
-    min_change = float(body.get("min_change", 0.0))
-    max_turn = float(body.get("max_turn", 100.0))
-    min_amount = float(body.get("min_amount", 0.0))
+    min_change, err_msg = _parse_finite_float(body.get("min_change"), 0.0, -35.0, 35.0, "min_change")
+    if err_msg:
+        return None, (err_msg, 400)
+    max_turn, err_msg = _parse_finite_float(body.get("max_turn"), 100.0, 0.0, 100.0, "max_turn")
+    if err_msg:
+        return None, (err_msg, 400)
+    min_amount, err_msg = _parse_finite_float(body.get("min_amount"), 0.0, 0.0, 10000.0, "min_amount")
+    if err_msg:
+        return None, (err_msg, 400)
+    max_stocks, err_msg = _parse_bounded_int(body.get("max_stocks"), 6000, 10, 6000, "max_stocks")
+    if err_msg:
+        return None, (err_msg, 400)
     exclude_st = bool(body.get("exclude_st", True))
     exclude_gem_star = bool(body.get("exclude_gem_star", False))
-    max_stocks = max(10, min(6000, int(body.get("max_stocks", 6000))))
+
+    if not (_valid_date_str(start_str) and _valid_date_str(end_str)):
+        return None, ("日期格式无效，请使用 YYYY-MM-DD", 400)
 
     started = time.perf_counter()
     universe = _get_universe_cached()
@@ -176,11 +274,8 @@ def _run_screen_core(body, emit=None):
     stride = max(1, len(universe) // limit)
     selected = universe[::stride][:limit]
 
-    try:
-        start_dt = pd.Timestamp(start_str).date()
-        end_dt = pd.Timestamp(end_str).date()
-    except (ValueError, TypeError):
-        return None, ("日期格式无效，请使用 YYYY-MM-DD", 400)
+    start_dt = pd.Timestamp(start_str).date()
+    end_dt = pd.Timestamp(end_str).date()
     if start_dt >= end_dt:
         return None, ("开始日期必须早于结束日期", 400)
 
@@ -282,8 +377,15 @@ def _run_screen_core(body, emit=None):
 
 
 async def api_screen(request):
-    body = await request.json()
-    data, err = await asyncio.to_thread(_run_screen_core, body)
+    body, body_err = await _read_json_dict(request)
+    if body_err is not None:
+        return JSONResponse({"error": body_err[0]}, status_code=body_err[1])
+    if not _SCREEN_SEM.acquire(blocking=False):
+        return JSONResponse({"error": "当前选股任务繁忙，请稍后再试"}, status_code=429)
+    try:
+        data, err = await asyncio.to_thread(_run_screen_core, body)
+    finally:
+        _SCREEN_SEM.release()
     if err is not None:
         return JSONResponse({"error": err[0]}, status_code=err[1])
     return JSONResponse(data)
@@ -291,7 +393,12 @@ async def api_screen(request):
 
 async def api_screen_stream(request):
     """流式 NDJSON 选股接口，实时推送扫描进度与最终信号榜单。"""
-    body = await request.json()
+    body, body_err = await _read_json_dict(request)
+    if body_err is not None:
+        return JSONResponse({"error": body_err[0]}, status_code=body_err[1])
+    if not _SCREEN_SEM.acquire(blocking=False):
+        return JSONResponse({"error": "当前选股任务繁忙，请稍后再试"}, status_code=429)
+
     loop = asyncio.get_running_loop()
     queue = asyncio.Queue()
 
@@ -306,8 +413,10 @@ async def api_screen_stream(request):
             else:
                 _emit({"type": "result", "data": data})
         except Exception as exc:
-            _emit({"type": "error", "error": str(exc), "status": 500})
+            print(f"[web_server] screen worker error: {exc}", file=sys.stderr)
+            _emit({"type": "error", "error": "选股计算发生内部异常，请稍后重试", "status": 500})
         finally:
+            _SCREEN_SEM.release()
             loop.call_soon_threadsafe(queue.put_nowait, None)
 
     threading.Thread(target=_worker, daemon=True).start()
@@ -328,11 +437,15 @@ async def api_screen_stream(request):
 
 async def api_kline(request):
     code = request.path_params["code"].strip()
+    if not _valid_code(code):
+        return JSONResponse({"error": "股票代码格式无效（需如 sh.600519 / sz.000001）"}, status_code=400)
     interval = request.query_params.get("interval", "日线")
     if interval not in ("日线", "周线", "月线"):
         interval = "日线"
     today_dt = date.today()
-    end_str = request.query_params.get("end") or today_dt.strftime("%Y-%m-%d")
+    end_str = (request.query_params.get("end") or today_dt.strftime("%Y-%m-%d")).strip()[:10]
+    if not _valid_date_str(end_str):
+        return JSONResponse({"error": "截止日期格式无效，请使用 YYYY-MM-DD"}, status_code=400)
 
     # 1. 本地日线（用于顶部精准换手率/成交额卡片，以及离线兜底）
     local_frame = db._cache_read(code, "1990-01-01", end_str)
@@ -439,19 +552,25 @@ async def api_watchlist_list(_request):
 
 
 async def api_watchlist_add(request):
-    body = await request.json()
+    body, body_err = await _read_json_dict(request)
+    if body_err is not None:
+        return JSONResponse({"error": body_err[0]}, status_code=body_err[1])
     code = str(body.get("code") or "").strip()
-    name = str(body.get("name") or "").strip()
-    if not code:
-        return JSONResponse({"error": "缺少股票代码"}, status_code=400)
-    if not name:
-        name = dict(_get_universe_cached()).get(code, code)
+    if not _valid_code(code):
+        return JSONResponse({"error": "股票代码格式无效（需如 sh.600519）"}, status_code=400)
+    raw_name = _CTRL_RE.sub("", str(body.get("name") or "")).strip()[:40]
+    name = raw_name or dict(_get_universe_cached()).get(code, code)
+    existing = db.watchlist_load()
+    if len(existing) >= _MAX_WATCHLIST_SIZE and code not in {r[0] for r in existing}:
+        return JSONResponse({"error": f"自选池已达上限（{_MAX_WATCHLIST_SIZE} 只）"}, status_code=400)
     db.watchlist_add(code, name)
     return JSONResponse({"ok": True, "items": _watchlist_with_quotes()})
 
 
 async def api_watchlist_delete(request):
     code = request.path_params["code"].strip()
+    if not _valid_code(code):
+        return JSONResponse({"error": "股票代码格式无效"}, status_code=400)
     db.watchlist_remove(code)
     return JSONResponse({"ok": True, "items": _watchlist_with_quotes()})
 
@@ -464,25 +583,38 @@ async def api_sync_start(_request):
 
 async def api_sync_status(_request):
     local_status = db.cache_status()
+    local_status["db_name"] = db.CACHE_DB.name
     mgr = sync.get_sync_manager_singleton()
     state = mgr.snapshot(local_status=local_status)
     return JSONResponse({"status": local_status, "auto_sync": state})
 
 
 async def api_sync_config(request):
-    body = await request.json()
+    body, body_err = await _read_json_dict(request)
+    if body_err is not None:
+        return JSONResponse({"error": body_err[0]}, status_code=body_err[1])
     enabled = bool(body.get("enabled", True))
-    sync_time = str(body.get("sync_time") or "15:35")
+    sync_time = str(body.get("sync_time") or "15:35").strip()
+    if sync_time not in db.AUTO_SYNC_TIMES:
+        return JSONResponse({"error": "不支持的自动同步时间"}, status_code=400)
     db.save_auto_sync_config(enabled, sync_time)
     mgr = sync.get_sync_manager_singleton()
     return JSONResponse({"ok": True, "auto_sync": mgr.snapshot()})
 
 
 async def api_export(request):
-    body = await request.json()
+    body, body_err = await _read_json_dict(request)
+    if body_err is not None:
+        return JSONResponse({"error": body_err[0]}, status_code=body_err[1])
     fmt = str(body.get("format") or "csv").lower()
-    codes = body.get("codes") or []
-    rows = body.get("signals") or []
+    if fmt not in ("csv", "ebk", "txt"):
+        return JSONResponse({"error": "不支持的导出格式"}, status_code=400)
+    raw_codes = body.get("codes") or []
+    raw_rows = body.get("signals") or []
+    if not isinstance(raw_codes, list) or not isinstance(raw_rows, list):
+        return JSONResponse({"error": "导出数据格式无效"}, status_code=400)
+    codes = [c for c in raw_codes[:_MAX_EXPORT_ROWS] if _valid_code(c)]
+    rows = [r for r in raw_rows[:_MAX_EXPORT_ROWS] if isinstance(r, dict)]
     today_tag = date.today().strftime("%Y%m%d")
 
     if fmt == "ebk":
@@ -499,17 +631,17 @@ async def api_export(request):
             media_type="text/plain; charset=utf-8",
             headers={"Content-Disposition": f'attachment; filename="klineradar_codes_{today_tag}.txt"'},
         )
-    # Default: CSV
+    # Default: CSV（文本列中和公式注入风险）
     df = pd.DataFrame([
         {
-            "策略": r.get("strategy", ""),
-            "代码": r.get("code", ""),
-            "名称": r.get("name", ""),
+            "策略": _csv_safe_cell(r.get("strategy", "")),
+            "代码": _csv_safe_cell(r.get("code", "")),
+            "名称": _csv_safe_cell(r.get("name", "")),
             "收盘": r.get("close"),
             "涨跌幅%": r.get("pctChg"),
             "换手率%": r.get("turn"),
             "成交额(亿)": r.get("amount_yi"),
-            "信号说明": r.get("reason", ""),
+            "信号说明": _csv_safe_cell(r.get("reason", "")),
         }
         for r in rows
     ])
@@ -518,6 +650,11 @@ async def api_export(request):
         media_type="text/csv; charset=utf-8",
         headers={"Content-Disposition": f'attachment; filename="klineradar_screen_{today_tag}.csv"'},
     )
+
+
+async def _handle_unexpected_error(_request, exc):
+    print(f"[web_server] unhandled error: {exc}", file=sys.stderr)
+    return JSONResponse({"error": "服务器内部错误，请稍后重试"}, status_code=500)
 
 
 routes = [
@@ -537,7 +674,58 @@ routes = [
     Mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static"),
 ]
 
-web_app = Starlette(routes=routes)
+class _SecurityMiddleware:
+    """纯 ASGI 安全中间件：跨站 CSRF 拦截 + 安全响应头（兼容流式 NDJSON 零缓冲）。"""
+
+    _SEC_HEADERS = [
+        (b"x-content-type-options", b"nosniff"),
+        (b"x-frame-options", b"DENY"),
+        (b"referrer-policy", b"no-referrer"),
+        (b"content-security-policy", _CSP_HEADER.encode("latin1")),
+    ]
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        method = scope.get("method", "GET").upper()
+        if method in ("POST", "PUT", "PATCH", "DELETE"):
+            hdrs = {k.lower(): v.decode("latin1").strip() for k, v in scope.get("headers", [])}
+            if hdrs.get(b"sec-fetch-site", "").lower() == "cross-site":
+                resp = JSONResponse({"error": "拒绝跨站请求"}, status_code=403)
+                await resp(scope, receive, send)
+                return
+            origin = hdrs.get(b"origin", "")
+            if origin:
+                host = hdrs.get(b"host", "").lower()
+                origin_netloc = (urlparse(origin).netloc or "").strip().lower()
+                if not origin_netloc or origin_netloc != host:
+                    resp = JSONResponse({"error": "拒绝异源请求"}, status_code=403)
+                    await resp(scope, receive, send)
+                    return
+
+        async def _send_with_headers(message):
+            if message["type"] == "http.response.start":
+                raw_hdrs = list(message.get("headers", []))
+                present = {k.lower() for k, _ in raw_hdrs}
+                for hk, hv in self._SEC_HEADERS:
+                    if hk not in present:
+                        raw_hdrs.append((hk, hv))
+                message = {**message, "headers": raw_hdrs}
+            await send(message)
+
+        await self.app(scope, receive, _send_with_headers)
+
+
+web_app = Starlette(
+    routes=routes,
+    middleware=[Middleware(_SecurityMiddleware)],
+    exception_handlers={500: _handle_unexpected_error},
+)
 
 
 def run_server(host="0.0.0.0", port=8506, open_browser=False):

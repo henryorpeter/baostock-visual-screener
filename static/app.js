@@ -79,7 +79,12 @@
       .replace(/&/g, "&amp;")
       .replace(/</g, "&lt;")
       .replace(/>/g, "&gt;")
-      .replace(/"/g, "&quot;");
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
+  }
+
+  function safeHexColor(val, fallback = "#848e9c") {
+    return typeof val === "string" && /^#[0-9a-fA-F]{3,8}$/.test(val) ? val : fallback;
   }
 
   function showToast(msg, isError = false) {
@@ -503,7 +508,7 @@
         return `
           <div class="strat-pop-group">
             <div class="strat-pop-ghead">
-              <span class="strat-pop-gtitle" style="color:${escHtml(meta.color)}">${escHtml(gName)}</span>
+              <span class="strat-pop-gtitle" style="color:${safeHexColor(meta.color)}">${escHtml(gName)}</span>
               <button class="link-btn" data-toggle-group="${escHtml(gName)}" type="button">仅选本组</button>
             </div>
             ${itemsHtml}
@@ -556,7 +561,7 @@
           <div class="matrix-group">
             <div class="matrix-ghead">
               <div class="matrix-gtitle">
-                <span class="matrix-dot" style="background:${escHtml(meta.color)}"></span>
+                <span class="matrix-dot" style="background:${safeHexColor(meta.color)}"></span>
                 <span>${escHtml(gName)}</span>
                 <span class="dock-badge">${meta.items.length}</span>
               </div>
@@ -1074,7 +1079,7 @@
 
     const ovHost = $("overlayChips");
     ovHost.innerHTML = overlays
-      .map((k) => `<button class="ind-chip${state.overlays.has(k) ? " active" : ""}" data-ov="${k}" type="button">${k}</button>`)
+      .map((k) => `<button class="ind-chip${state.overlays.has(k) ? " active" : ""}" data-ov="${escHtml(k)}" type="button">${escHtml(k)}</button>`)
       .join("");
     ovHost.addEventListener("click", (e) => {
       const btn = e.target.closest(".ind-chip");
@@ -1088,7 +1093,7 @@
 
     const subHost = $("subChips");
     subHost.innerHTML = subs
-      .map((k) => `<button class="ind-chip${state.subs.has(k) ? " active" : ""}" data-sub="${k}" type="button">${k}</button>`)
+      .map((k) => `<button class="ind-chip${state.subs.has(k) ? " active" : ""}" data-sub="${escHtml(k)}" type="button">${escHtml(k)}</button>`)
       .join("");
     subHost.addEventListener("click", (e) => {
       const btn = e.target.closest(".ind-chip");
@@ -1554,7 +1559,7 @@
       case "ATR":
         return `<span style="color:#fb923c">ATR(14) ${fmtNum(b.atr14, 3)}</span>`;
       default:
-        return key;
+        return escHtml(key);
     }
   }
 
@@ -1633,6 +1638,21 @@
   }
 
   // ==================== SYNC & CACHE VIEW ====================
+  function formatLastSyncSummary(autoSync) {
+    if (autoSync.error) return `上次同步异常：${autoSync.error}`;
+    const info = autoSync.last_info;
+    if (info && typeof info === "object" && info.time) {
+      if (info.status === "error" && info.error) {
+        return `${info.time} 同步失败：${info.error}`;
+      }
+      const upd = info.updated ?? 0;
+      const skip = info.skipped ?? 0;
+      const fail = info.failed ?? 0;
+      return `最近同步 ${info.time}（更新 ${upd} / 跳过 ${skip}${fail ? ` / 失败 ${fail}` : ""}）`;
+    }
+    return autoSync.text || "空闲";
+  }
+
   function renderCacheStatus(status, autoSync, timesList) {
     if (status) {
       const shortDate = status.newest ? status.newest.slice(5) : "--";
@@ -1641,7 +1661,7 @@
       $("kpiRows").textContent = (status.rows || 0).toLocaleString();
       $("kpiNewest").textContent = status.newest || "--";
       $("kpiSize").textContent = status.size_mb !== undefined ? `${Number(status.size_mb).toFixed(1)} MB` : "--";
-      $("cacheDbPath").textContent = status.db_path ? `SQLite 路径：${status.db_path}` : "";
+      $("cacheDbPath").textContent = status.db_name ? `本地库文件：${status.db_name}` : "";
     }
 
     if (timesList && $("autoSyncTime").options.length === 0) {
@@ -1654,13 +1674,14 @@
       $("autoSyncEnabled").checked = Boolean(autoSync.enabled);
       if (autoSync.sync_time) $("autoSyncTime").value = autoSync.sync_time;
 
-      const pct = Math.round((autoSync.progress || 0) * 100);
+      const rawRatio = autoSync.ratio ?? autoSync.progress ?? 0;
+      const pct = Math.max(0, Math.min(100, Math.round(rawRatio * 100)));
       $("syncProgressBar").style.width = `${pct}%`;
       $("syncProgressText").textContent = `${pct}%`;
       $("syncPhaseText").textContent = autoSync.running
-        ? (autoSync.phase || "正在同步...")
-        : (autoSync.last_summary || "空闲");
-      $("autoSyncStatusText").textContent = autoSync.status_text || autoSync.reason || "就绪";
+        ? (autoSync.text || "正在同步...")
+        : formatLastSyncSummary(autoSync);
+      $("autoSyncStatusText").textContent = autoSync.today_status || "就绪";
 
       const navBtn = $("navSyncBtn");
       navBtn.classList.toggle("syncing", Boolean(autoSync.running));
@@ -1699,7 +1720,7 @@
       if (data && data.auto_sync && !data.auto_sync.running) {
         clearInterval(state.syncTimer);
         state.syncTimer = null;
-        showToast(data.auto_sync.last_summary || "行情同步完成");
+        showToast(formatLastSyncSummary(data.auto_sync), Boolean(data.auto_sync.error));
       }
     }, 1500);
   }
