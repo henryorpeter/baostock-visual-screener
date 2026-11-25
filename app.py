@@ -380,24 +380,19 @@ def main():
         local_status = db.cache_status(force=True)
         auto_state = sync_mgr.snapshot(local_status=local_status)
 
-    # 打开页面直接进入实时行情界面（本地有数据时自动完成首屏 0.4s 扫描，不再展示空荡荡的欢迎页）
-    if run_btn and valid_params:
+    # 不在首屏自动阻塞扫描或提前渲染 K 线，确保打开页面秒开；点击「开始选股」后再执行扫描
+    should_scan = run_btn or st.session_state.pop("trigger_scan", False)
+    if should_scan and valid_params:
         _run_screen_action(
             start, end, strategies, min_change, min_turn, max_turn, max_stocks,
             exclude_st=exclude_st, exclude_gem_star=exclude_gem_star, min_amount=min_amount,
-        )
-    elif "result" not in st.session_state and valid_params and local_status["stocks"] > 0:
-        _run_screen_action(
-            start, end, strategies, min_change, min_turn, max_turn, max_stocks,
-            exclude_st=exclude_st, exclude_gem_star=exclude_gem_star, min_amount=min_amount,
-            silent=True,
         )
 
     result = st.session_state.get("result")
     watchlist_rows = db.watchlist_load()
     watchlist_codes = {r[0] for r in watchlist_rows}
 
-    # ========================== Top Flat Header & Native Tabs ==========================
+    # ========================== Top Flat Header & Lazy Native Nav ==========================
     charts._render_hero(local_status, strategies, auto_sync=auto_state, result=result)
 
     if auto_state["running"]:
@@ -410,17 +405,53 @@ def main():
 
     hit_txt = f" ({len(result)})" if result is not None and not result.empty else ""
     wl_txt = f" ({len(watchlist_rows)})" if watchlist_rows else ""
-    tab_trade, tab_watch, tab_wiki, tab_data = st.tabs([
-        f"行情终端{hit_txt}",
-        f"自选快查{wl_txt}",
-        "策略矩阵 (20)",
-        "数据缓存",
-    ])
+    nav_labels = {
+        "trade": f"行情终端{hit_txt}",
+        "watch": f"自选快查{wl_txt}",
+        "wiki": "策略矩阵 (20)",
+        "data": "数据缓存",
+    }
+    active_nav = st.segmented_control(
+        "导航",
+        options=list(nav_labels.keys()),
+        format_func=lambda k: nav_labels[k],
+        default="trade",
+        label_visibility="collapsed",
+        key="main_nav_seg",
+    ) or "trade"
 
     # ========================== Tab 1: OKX / TradingView 主图在左 · 信号榜在右 ==========================
-    with tab_trade:
+    if active_nav == "trade":
         if result is None:
-            st.info("本地暂无行情数据，请先点击左侧「同步行情」初始化缓存。")
+            strat_tags = "".join(f'<span class="wait-tag">{escape(s)}</span>' for s in strategies)
+            st.markdown(
+                f'<div class="wait-panel">'
+                f'<div class="wait-main">'
+                f'<svg width="34" height="34" viewBox="0 0 24 24" fill="none">'
+                f'<path d="M6 19V11M6 7V5M12 19V15M12 9V5M18 19V13M18 7V5" stroke="#555c69" stroke-width="1.5" stroke-linecap="round"/>'
+                f'<rect x="4" y="7" width="4" height="4" rx="0.8" stroke="#f6465d" stroke-width="1.4"/>'
+                f'<rect x="10" y="9" width="4" height="6" rx="0.8" stroke="#0ecb81" stroke-width="1.4"/>'
+                f'<rect x="16" y="7" width="4" height="6" rx="0.8" stroke="#f6465d" stroke-width="1.4"/>'
+                f'</svg>'
+                f'<div class="wait-title">选择策略与过滤条件后，点击开始选股</div>'
+                f'<div class="wait-sub">本地已就绪 <strong style="color:#e6e8ec;">{local_status["stocks"]:,}</strong> 只 A 股日线'
+                f'（最新 {escape(str(local_status["newest"] or "暂无"))} · 区间 {start:%Y-%m-%d} ~ {end:%Y-%m-%d}）。'
+                f'选股完成后将自动呈现右侧信号榜与左侧 TradingView 多指标 K 线图。</div>'
+                f'<div class="wait-tags">{strat_tags}</div>'
+                f'</div>'
+                f'<div class="wait-steps">'
+                f'<div class="wait-step"><div class="wait-step-num">01 / 配置参数</div><div class="wait-step-txt">在左侧勾选策略流派，并按需设置排除 ST、最低涨幅与成交额</div></div>'
+                f'<div class="wait-step"><div class="wait-step-num">02 / 极速扫描</div><div class="wait-step-txt">点击「开始选股」，纯 NumPy 引擎离线全市场扫描（无需等待网络）</div></div>'
+                f'<div class="wait-step"><div class="wait-step-num">03 / 分屏复盘</div><div class="wait-step-txt">点击右侧信号行即时切换左侧 K 线，支持 BOLL/EMA/KDJ/RSI 等 14 项指标</div></div>'
+                f'</div>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+            _, c_btn, _ = st.columns([2.2, 1.2, 2.2])
+            with c_btn:
+                if st.button("开始选股", type="primary", width="stretch", disabled=not valid_params, key="quick_start_scan_btn"):
+                    st.session_state["trigger_scan"] = True
+                    st.rerun()
         elif result.empty:
             st.info("当前过滤条件下暂无命中标的，可在左侧放宽最低涨幅或成交额条件后重新选股。")
         else:
@@ -656,7 +687,7 @@ def main():
                             )
 
     # ========================== Tab 2: 自选快查（左主图 · 右自选） ==========================
-    with tab_watch:
+    elif active_nav == "watch":
         all_universe = db.cache_universe_load()
         all_name_map = dict(all_universe)
         all_codes_list = [c for c, _ in all_universe]
@@ -780,7 +811,7 @@ def main():
                 )
 
     # ========================== Tab 3: 策略矩阵 ==========================
-    with tab_wiki:
+    elif active_nav == "wiki":
         group_opts = ["全部"] + list(engine.STRATEGY_GROUPS.keys())
         group_choice = st.pills("流派", options=group_opts, default="全部", label_visibility="collapsed", key="wiki_group_pill") or "全部"
         groups_to_show = (
@@ -809,7 +840,7 @@ def main():
                     )
 
     # ========================== Tab 4: 数据缓存 ==========================
-    with tab_data:
+    elif active_nav == "data":
         charts._render_kpi_cards(local_status, result, st.session_state.get("scan_count"))
 
         ac1, ac2, ac3, ac4 = st.columns([1.2, 1.2, 2.0, 1.2], vertical_alignment="bottom")

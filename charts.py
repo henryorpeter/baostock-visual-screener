@@ -710,6 +710,73 @@ html, body, [class*="css"] {
     line-height: 1.48;
 }
 
+/* Clean flat pre-scan workspace placeholder (no glow, no gradients) */
+.wait-panel {
+    margin: 10px 0 14px 0;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    overflow: hidden;
+}
+.wait-main {
+    padding: 56px 24px 40px 24px;
+    text-align: center;
+}
+.wait-title {
+    font-size: 1.08rem;
+    font-weight: 600;
+    color: var(--text);
+    margin: 12px 0 8px 0;
+}
+.wait-sub {
+    font-size: 0.82rem;
+    color: var(--muted);
+    margin: 0 auto 16px auto;
+    max-width: 620px;
+    line-height: 1.6;
+}
+.wait-tags {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: center;
+    gap: 6px;
+}
+.wait-tag {
+    font-size: 0.73rem;
+    color: #c5cad4;
+    background: var(--panel-2);
+    border: 1px solid var(--line-2);
+    padding: 2px 9px;
+    border-radius: 3px;
+}
+.wait-steps {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    border-top: 1px solid var(--line);
+    background: #101318;
+}
+.wait-step {
+    padding: 14px 18px;
+    border-right: 1px solid var(--line);
+}
+.wait-step:last-child { border-right: none; }
+.wait-step-num {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.7rem;
+    color: var(--red);
+    font-weight: 600;
+    margin-bottom: 3px;
+}
+.wait-step-txt {
+    font-size: 0.78rem;
+    color: var(--muted);
+}
+@media (max-width: 768px) {
+    .wait-steps { grid-template-columns: 1fr; }
+    .wait-step { border-right: none; border-bottom: 1px solid var(--line); }
+    .wait-step:last-child { border-bottom: none; }
+}
+
 /* Compact Floating Progress Overlay */
 .scan-float-backdrop {
     position: fixed;
