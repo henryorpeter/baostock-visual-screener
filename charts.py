@@ -6,6 +6,45 @@ import pandas as pd
 import streamlit as st
 
 
+MAIN_OVERLAYS = ("MA", "EMA", "BOLL")
+SUB_INDICATORS = ("VOL", "MACD", "KDJ", "RSI")
+
+
+def _kdj_series(high, low, close, n=9):
+    """标准 A 股 / 交易所递推 KDJ (9, 3, 3)。"""
+    low_n = low.rolling(n).min()
+    high_n = high.rolling(n).max()
+    rsv = (close - low_n) / (high_n - low_n).replace(0, float("nan")) * 100.0
+    k_vals, d_vals, j_vals = [], [], []
+    k, d_v = 50.0, 50.0
+    for val in rsv:
+        if pd.isna(val):
+            k_vals.append(float("nan"))
+            d_vals.append(float("nan"))
+            j_vals.append(float("nan"))
+        else:
+            k = (2.0 / 3.0) * k + (1.0 / 3.0) * float(val)
+            d_v = (2.0 / 3.0) * d_v + (1.0 / 3.0) * k
+            j = 3.0 * k - 2.0 * d_v
+            k_vals.append(k)
+            d_vals.append(d_v)
+            j_vals.append(j)
+    return k_vals, d_vals, j_vals
+
+
+def _rsi_series(close, window):
+    delta = close.diff()
+    gain = delta.clip(lower=0.0)
+    loss = -delta.clip(upper=0.0)
+    avg_g = gain.ewm(alpha=1.0 / window, min_periods=window, adjust=False).mean()
+    avg_l = loss.ewm(alpha=1.0 / window, min_periods=window, adjust=False).mean()
+    rs = avg_g / avg_l.replace(0, float("nan"))
+    rsi = 100.0 - 100.0 / (1.0 + rs)
+    rsi = rsi.where(~((avg_l == 0) & (avg_g > 0)), 100.0)
+    rsi = rsi.where(~((avg_l == 0) & (avg_g == 0)), 50.0)
+    return rsi
+
+
 def _resample_kline(frame, interval):
     d = frame.copy().sort_values("date").dropna(subset=["open", "high", "low", "close"])
     d["volume"] = pd.to_numeric(d.volume, errors="coerce").fillna(0)
@@ -20,23 +59,53 @@ def _resample_kline(frame, interval):
             date=("date", "last"), open=("open", "first"), high=("high", "max"),
             low=("low", "min"), close=("close", "last"), volume=("volume", "sum"),
         ).reset_index(drop=True)
+    # 主图均线 MA / EMA / BOLL
     for window in (5, 10, 20, 30):
         d[f"ma{window}"] = d.close.rolling(window).mean()
-    ema12 = d.close.ewm(span=12, adjust=False).mean()
-    ema26 = d.close.ewm(span=26, adjust=False).mean()
-    d["dif"] = ema12 - ema26
+    for span in (12, 26, 60):
+        d[f"ema{span}"] = d.close.ewm(span=span, adjust=False).mean()
+    boll_mid = d.close.rolling(20).mean()
+    boll_std = d.close.rolling(20).std(ddof=0)
+    d["boll_mid"] = boll_mid
+    d["boll_up"] = boll_mid + 2.0 * boll_std
+    d["boll_dn"] = boll_mid - 2.0 * boll_std
+    # 成交量均量
+    d["vol_ma5"] = d.volume.rolling(5).mean()
+    d["vol_ma10"] = d.volume.rolling(10).mean()
+    # MACD (12, 26, 9)
+    d["dif"] = d["ema12"] - d["ema26"]
     d["dea"] = d["dif"].ewm(span=9, adjust=False).mean()
     d["macd_hist"] = (d["dif"] - d["dea"]) * 2
+    # KDJ (9, 3, 3)
+    d["kdj_k"], d["kdj_d"], d["kdj_j"] = _kdj_series(d.high, d.low, d.close, n=9)
+    # RSI (6, 12, 24)
+    for w in (6, 12, 24):
+        d[f"rsi{w}"] = _rsi_series(d.close, w)
     d["time"] = pd.to_datetime(d.date).dt.strftime("%Y-%m-%d")
     return d
 
 
-def chart_panes(frame, title, interval, show_ma=True, show_macd=False, display_start=None):
+def calc_chart_height(sub_panes, mobile_compact=False):
+    n_sub = len(sub_panes)
+    if mobile_compact:
+        return 250 + n_sub * 96
+    return 355 + n_sub * 106
+
+
+def chart_panes(
+    frame, title, interval,
+    show_ma=True, show_macd=False, display_start=None,
+    overlays=None, sub_panes=None,
+):
     d = _resample_kline(frame, interval)
     if display_start is not None and not d.empty:
         sliced = d[d["date"] >= pd.Timestamp(display_start)].reset_index(drop=True)
         if not sliced.empty:
             d = sliced
+
+    active_overlays = set(overlays) if overlays is not None else ({"MA"} if show_ma else set())
+    active_subs = list(sub_panes) if sub_panes is not None else (["VOL", "MACD"] if show_macd else ["VOL"])
+
     up, down = "#f6465d", "#0ecb81"
     theme = {
         "layout": {
@@ -62,6 +131,23 @@ def chart_panes(frame, title, interval, show_ma=True, show_macd=False, display_s
             "horzLine": {"color": "#4b5262", "style": 2, "width": 1},
         },
     }
+
+    def _line_series(col, color, width=1, style=0):
+        pts = d[["time", col]].dropna().rename(columns={col: "value"}).to_dict("records")
+        if not pts:
+            return None
+        opts = {
+            "color": color,
+            "lineWidth": width,
+            "title": "",
+            "priceLineVisible": False,
+            "lastValueVisible": False,
+            "crosshairMarkerVisible": False,
+        }
+        if style:
+            opts["lineStyle"] = style
+        return {"type": "Line", "data": pts, "options": opts}
+
     candles = d[["time", "open", "high", "low", "close"]].to_dict("records")
     price_series = [{
         "type": "Candlestick",
@@ -72,41 +158,43 @@ def chart_panes(frame, title, interval, show_ma=True, show_macd=False, display_s
             "wickUpColor": up, "wickDownColor": down,
         },
     }]
-    if show_ma:
+    if "MA" in active_overlays:
         for window, color in ((5, "#f0b90b"), (10, "#e879f9"), (20, "#38bdf8"), (30, "#fb923c")):
-            line = d[["time", f"ma{window}"]].dropna().rename(columns={f"ma{window}": "value"}).to_dict("records")
-            if line:
-                price_series.append({
-                    "type": "Line",
-                    "data": line,
-                    "options": {
-                        "color": color,
-                        "lineWidth": 1,
-                        "title": "",
-                        "priceLineVisible": False,
-                        "lastValueVisible": False,
-                        "crosshairMarkerVisible": False,
-                    },
-                })
+            s = _line_series(f"ma{window}", color)
+            if s:
+                price_series.append(s)
+    if "EMA" in active_overlays:
+        for span, color in ((12, "#22d3ee"), (26, "#a78bfa"), (60, "#f59e0b")):
+            s = _line_series(f"ema{span}", color)
+            if s:
+                price_series.append(s)
+    if "BOLL" in active_overlays:
+        for col, color, sty in (("boll_up", "#f59e0b", 2), ("boll_mid", "#d4d8e2", 0), ("boll_dn", "#a855f7", 2)):
+            s = _line_series(col, color, style=sty)
+            if s:
+                price_series.append(s)
 
-    volume = [
-        {
-            "time": row.time,
-            "value": float(row.volume),
-            "color": "rgba(246, 70, 93, 0.48)" if row.close >= row.open else "rgba(14, 203, 129, 0.44)",
-        }
-        for row in d.itertuples(index=False)
-    ]
     panes = [
-        {"chart": theme, "height": 330, "title": f"{title} · {interval}", "series": price_series},
-        {
-            "chart": theme,
-            "height": 84,
-            "title": "VOL",
-            "series": [{"type": "Histogram", "data": volume, "options": {"priceFormat": {"type": "volume"}}}],
-        },
+        {"chart": theme, "height": 325, "title": f"{title} · {interval}", "series": price_series},
     ]
-    if show_macd:
+
+    if "VOL" in active_subs:
+        volume = [
+            {
+                "time": row.time,
+                "value": float(row.volume),
+                "color": "rgba(246, 70, 93, 0.48)" if row.close >= row.open else "rgba(14, 203, 129, 0.44)",
+            }
+            for row in d.itertuples(index=False)
+        ]
+        vol_series = [{"type": "Histogram", "data": volume, "options": {"priceFormat": {"type": "volume"}}}]
+        for col, color in (("vol_ma5", "#f0b90b"), ("vol_ma10", "#e879f9")):
+            s = _line_series(col, color)
+            if s:
+                vol_series.append(s)
+        panes.append({"chart": theme, "height": 84, "title": "VOL(5,10)", "series": vol_series})
+
+    if "MACD" in active_subs:
         macd_bars = [
             {
                 "time": row.time,
@@ -115,18 +203,37 @@ def chart_panes(frame, title, interval, show_ma=True, show_macd=False, display_s
             }
             for row in d.dropna(subset=["macd_hist"]).itertuples(index=False)
         ]
-        dif_data = d[["time", "dif"]].dropna().rename(columns={"dif": "value"}).to_dict("records")
-        dea_data = d[["time", "dea"]].dropna().rename(columns={"dea": "value"}).to_dict("records")
-        panes.append({
-            "chart": theme,
-            "height": 102,
-            "title": "MACD(12,26,9)",
-            "series": [
-                {"type": "Histogram", "data": macd_bars, "options": {"title": "", "priceLineVisible": False, "lastValueVisible": False}},
-                {"type": "Line", "data": dif_data, "options": {"color": "#f0b90b", "lineWidth": 1, "title": "", "priceLineVisible": False, "lastValueVisible": False, "crosshairMarkerVisible": False}},
-                {"type": "Line", "data": dea_data, "options": {"color": "#e879f9", "lineWidth": 1, "title": "", "priceLineVisible": False, "lastValueVisible": False, "crosshairMarkerVisible": False}},
-            ],
-        })
+        macd_series = [
+            {"type": "Histogram", "data": macd_bars, "options": {"title": "", "priceLineVisible": False, "lastValueVisible": False}},
+        ]
+        for col, color in (("dif", "#f0b90b"), ("dea", "#e879f9")):
+            s = _line_series(col, color)
+            if s:
+                macd_series.append(s)
+        panes.append({"chart": theme, "height": 98, "title": "MACD(12,26,9)", "series": macd_series})
+
+    if "KDJ" in active_subs:
+        kdj_series = [
+            s for s in (
+                _line_series("kdj_k", "#f0b90b"),
+                _line_series("kdj_d", "#38bdf8"),
+                _line_series("kdj_j", "#e879f9"),
+            ) if s
+        ]
+        if kdj_series:
+            panes.append({"chart": theme, "height": 98, "title": "KDJ(9,3,3)", "series": kdj_series})
+
+    if "RSI" in active_subs:
+        rsi_series = [
+            s for s in (
+                _line_series("rsi6", "#f0b90b"),
+                _line_series("rsi12", "#38bdf8"),
+                _line_series("rsi24", "#e879f9"),
+            ) if s
+        ]
+        if rsi_series:
+            panes.append({"chart": theme, "height": 98, "title": "RSI(6,12,24)", "series": rsi_series})
+
     return panes, d
 
 

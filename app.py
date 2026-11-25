@@ -143,9 +143,9 @@ def _run_screen_action(
 
 def _render_stock_terminal(
     code, name, start_date, end_date, interval, mobile_compact,
-    hit_list=None, show_ma=True, show_macd=True, chart_key_prefix="chart",
+    hit_list=None, chart_key_prefix="chart",
 ):
-    """OKX 扁平 Ticker 栏 + 无缝 TradingView K 线主图。"""
+    """OKX 扁平 Ticker 栏 + 主图(MA/EMA/BOLL) & 副图(VOL/MACD/KDJ/RSI) 完整 K 线终端。"""
     if interval in ("周线", "月线"):
         fetch_start_str, display_start = "1990-01-01", None
     else:
@@ -189,35 +189,72 @@ def _render_stock_terminal(
         unsafe_allow_html=True,
     )
 
+    # OKX/交易所风格指标工具行：主图叠加（MA/EMA/BOLL）+ 副图指标（VOL/MACD/KDJ/RSI）
+    ic1, ic2 = st.columns([1.0, 1.35], vertical_alignment="center")
+    with ic1:
+        overlays = st.pills(
+            "主图指标",
+            options=list(charts.MAIN_OVERLAYS),
+            default=["MA"],
+            selection_mode="multi",
+            label_visibility="collapsed",
+            key=f"{chart_key_prefix}_overlays",
+        ) or []
+    with ic2:
+        sub_panes = st.pills(
+            "副图指标",
+            options=list(charts.SUB_INDICATORS),
+            default=["VOL", "MACD"],
+            selection_mode="multi",
+            label_visibility="collapsed",
+            key=f"{chart_key_prefix}_subs",
+        ) or []
+
     panes, kdf = charts.chart_panes(
         frame, f"{name} {code}", interval,
-        show_ma=show_ma, show_macd=show_macd, display_start=display_start,
+        display_start=display_start,
+        overlays=overlays, sub_panes=sub_panes,
     )
     last_k = kdf.iloc[-1]
+
+    def _fv(col, fmt=".2f"):
+        v = last_k.get(col)
+        return format(float(v), fmt) if pd.notna(v) else "—"
+
     parts = []
-    if show_ma:
+    if "MA" in overlays:
         for w, col in ((5, "#f0b90b"), (10, "#e879f9"), (20, "#38bdf8"), (30, "#fb923c")):
-            v = last_k.get(f"ma{w}")
-            vs = f"{v:.2f}" if pd.notna(v) else "—"
-            parts.append(f'<span style="color:{col};">MA{w} {vs}</span>')
-    if show_macd:
-        dif_v, dea_v, hist_v = last_k.get("dif"), last_k.get("dea"), last_k.get("macd_hist")
-        dif_s = f"{dif_v:.3f}" if pd.notna(dif_v) else "—"
-        dea_s = f"{dea_v:.3f}" if pd.notna(dea_v) else "—"
-        hist_s = f"{hist_v:+.3f}" if pd.notna(hist_v) else "—"
-        parts.append(f'<span style="color:#f0b90b;">DIF {dif_s}</span>')
-        parts.append(f'<span style="color:#e879f9;">DEA {dea_s}</span>')
-        parts.append(f'<span>MACD {hist_s}</span>')
+            parts.append(f'<span style="color:{col};">MA{w} {_fv(f"ma{w}")}</span>')
+    if "EMA" in overlays:
+        for s, col in ((12, "#22d3ee"), (26, "#a78bfa"), (60, "#f59e0b")):
+            parts.append(f'<span style="color:{col};">EMA{s} {_fv(f"ema{s}")}</span>')
+    if "BOLL" in overlays:
+        parts.append(f'<span style="color:#f59e0b;">UP {_fv("boll_up")}</span>')
+        parts.append(f'<span style="color:#d4d8e2;">MID {_fv("boll_mid")}</span>')
+        parts.append(f'<span style="color:#a855f7;">DN {_fv("boll_dn")}</span>')
+    if "MACD" in sub_panes:
+        parts.append(f'<span style="color:#f0b90b;">DIF {_fv("dif", ".3f")}</span>')
+        parts.append(f'<span style="color:#e879f9;">DEA {_fv("dea", ".3f")}</span>')
+        parts.append(f'<span>MACD {_fv("macd_hist", "+.3f")}</span>')
+    if "KDJ" in sub_panes:
+        parts.append(f'<span style="color:#f0b90b;">K {_fv("kdj_k", ".1f")}</span>')
+        parts.append(f'<span style="color:#38bdf8;">D {_fv("kdj_d", ".1f")}</span>')
+        parts.append(f'<span style="color:#e879f9;">J {_fv("kdj_j", ".1f")}</span>')
+    if "RSI" in sub_panes:
+        parts.append(f'<span style="color:#f0b90b;">RSI6 {_fv("rsi6", ".1f")}</span>')
+        parts.append(f'<span style="color:#38bdf8;">RSI12 {_fv("rsi12", ".1f")}</span>')
+        parts.append(f'<span style="color:#e879f9;">RSI24 {_fv("rsi24", ".1f")}</span>')
     if parts:
         st.markdown(f'<div class="ma-bar">{"".join(parts)}</div>', unsafe_allow_html=True)
 
-    chart_height = (430 if show_macd else 340) if mobile_compact else (560 if show_macd else 450)
+    chart_height = charts.calc_chart_height(sub_panes, mobile_compact=mobile_compact)
+    ind_sig = "_".join(sorted(overlays)) + "__" + "_".join(sub_panes)
     lightweight_charts_v5_component(
         name=f"{name} {code}",
         charts=panes,
         height=chart_height,
         zoom_level=65 if mobile_compact else 84,
-        key=f"{chart_key_prefix}_{code}_{interval}_{show_ma}_{show_macd}_{mobile_compact}",
+        key=f"{chart_key_prefix}_{code}_{interval}_{ind_sig}_{mobile_compact}",
     )
 
 
@@ -533,7 +570,7 @@ def main():
                     current_idx = stock_codes.index(st.session_state["active_stock"])
 
                     # 全部使用统一原生组件的一行控制条（零截断、零高度错位）
-                    c1, c2, c3, c4, c5, c6, c7 = st.columns([1.80, 0.46, 0.46, 0.78, 2.02, 0.66, 0.82], vertical_alignment="center")
+                    c1, c2, c3, c4, c5 = st.columns([2.25, 0.48, 0.48, 0.90, 2.05], vertical_alignment="center")
                     with c1:
                         choice = st.selectbox(
                             "标的",
@@ -570,10 +607,6 @@ def main():
                             label_visibility="collapsed",
                             key="kline_interval_seg",
                         ) or "日线"
-                    with c6:
-                        show_ma = st.checkbox("MA", value=True)
-                    with c7:
-                        show_macd = st.checkbox("MACD", value=True)
 
                     choice = st.session_state["active_stock"]
                     start_date, end_date = st.session_state["range"]
@@ -581,7 +614,7 @@ def main():
                     _render_stock_terminal(
                         choice, name_by_code[choice], start_date, end_date, interval,
                         mobile_compact=mobile_compact, hit_list=hit_list,
-                        show_ma=show_ma, show_macd=show_macd, chart_key_prefix="chart",
+                        chart_key_prefix="chart",
                     )
 
             # 历史胜率速验（仅结束日期早于最新交易日时显示）
@@ -727,7 +760,7 @@ def main():
                     ) or "日线"
                 _render_stock_terminal(
                     active_wl, wl_name_map[active_wl], start, end, wl_interval,
-                    mobile_compact=mobile_compact, show_ma=True, show_macd=True,
+                    mobile_compact=mobile_compact,
                     chart_key_prefix="wl_chart",
                 )
 

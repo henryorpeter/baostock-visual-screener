@@ -212,6 +212,18 @@ def test_charts_resample_panes_and_formatters():
         panes, kdf = charts.chart_panes(df, "测试 · sh.600000", iv, show_ma=True, show_macd=True)
         assert len(panes) == 3 and not kdf.empty
 
+    # 全套主图(MA/EMA/BOLL) + 副图(VOL/MACD/KDJ/RSI) 叠加验证
+    full_panes, kdf_all = charts.chart_panes(
+        df, "测试 · sh.600000", "日线",
+        overlays=["MA", "EMA", "BOLL"],
+        sub_panes=["VOL", "MACD", "KDJ", "RSI"],
+    )
+    assert len(full_panes) == 5
+    # 主图包含：1 蜡烛 + 4 MA + 3 EMA + 3 BOLL = 11 条序列
+    assert len(full_panes[0]["series"]) == 11
+    for col in ("ema12", "ema60", "boll_up", "boll_dn", "kdj_k", "kdj_d", "kdj_j", "rsi6", "rsi12", "rsi24"):
+        assert col in kdf_all.columns and kdf_all[col].dropna().size > 50
+
     assert charts._fmt_amount(2.5e8) == "2.50 亿"
     assert charts._fmt_amount(3.2e4) == "3 万"
     assert charts._fmt_volume(1.5e6) == "1.50 M"
