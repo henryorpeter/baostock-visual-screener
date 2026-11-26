@@ -46,6 +46,7 @@
     compactSubs: false,
     klineData: null,
     intradayData: null,
+    intradayCtx: null,
     intradayTimer: null,
     barByTime: new Map(),
     prevCloseByTime: new Map(),
@@ -162,6 +163,7 @@
         },
       });
       // Re-render candlesticks/histograms cleanly with theme-adjusted up/down colors
+      state.intradayCtx = null;
       if (state.interval === "分时" && state.intradayData) renderIntradayChart(state.intradayData);
       else if (state.klineData) renderChart(state.klineData);
     }
@@ -1180,7 +1182,7 @@
       ) {
         loadIntraday(state.currentCode, state.currentName, true);
       }
-    }, 15000);
+    }, 5000);
   }
 
   async function openStock(code, name) {
@@ -1213,7 +1215,12 @@
       state.intradayData = data;
       state.currentName = data.name || name || code;
       renderTickerStrip(data);
-      renderIntradayChart(data);
+      // 同一只股票且画布已就绪时原地增量更新（0 闪烁、不打断鼠标十字光标悬停）
+      if (silent && state.intradayCtx && state.intradayCtx.code === data.code && state.intradayCtx.date === data.date) {
+        updateIntradayInPlace(data);
+      } else {
+        renderIntradayChart(data);
+      }
       if (data.is_live) startIntradayPolling();
       else stopIntradayPolling();
     } catch (err) {
@@ -1223,9 +1230,113 @@
     }
   }
 
+  // 标准 A 股全天 241 分钟时间轴（09:30..11:30 + 13:01..15:00），映射到 00:00..04:00 (step=60s)
+  // 这样 LightweightCharts 刻度自然落在 09:30 / 10:00 / 10:30 / 11:00 / 11:30/13:00 / 13:30 / 14:00 / 14:30 / 15:00
+  const INTRADAY_SLOTS = (() => {
+    const list = [];
+    const byHHMM = new Map();
+    const byTs = new Map();
+    const pushSlot = (hhmm) => {
+      const ts = list.length * 60;
+      list.push({ ts, hhmm });
+      byHHMM.set(hhmm, ts);
+      byTs.set(ts, hhmm);
+    };
+    for (let m = 9 * 60 + 30; m <= 11 * 60 + 30; m++) {
+      pushSlot(`${String(Math.floor(m / 60)).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}`);
+    }
+    for (let m = 13 * 60 + 1; m <= 15 * 60; m++) {
+      pushSlot(`${String(Math.floor(m / 60)).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}`);
+    }
+    byHHMM.set("13:00", byHHMM.get("11:30"));
+    return { list, byHHMM, byTs };
+  })();
+
+  function buildIntradaySeriesData(data, palette) {
+    const pts = data.points || [];
+    const prevClose = Number(data.prev_close) || (pts[0]?.price ?? 0);
+    const ptByTs = new Map();
+    pts.forEach((pt, idx) => {
+      const ts = INTRADAY_SLOTS.byHHMM.get(pt.hhmm);
+      if (ts !== undefined) {
+        ptByTs.set(ts, {
+          ...pt,
+          prevPrice: idx > 0 ? pts[idx - 1].price : prevClose,
+        });
+      }
+    });
+
+    let maxDev = prevClose * 0.012;
+    for (const pt of pts) {
+      maxDev = Math.max(maxDev, Math.abs(pt.price - prevClose), Math.abs(pt.avg - prevClose));
+    }
+    const yMin = prevClose - maxDev * 1.12;
+    const yMax = prevClose + maxDev * 1.12;
+
+    const priceData = [];
+    const avgData = [];
+    const volData = [];
+    const anchorData = [];
+    for (const { ts } of INTRADAY_SLOTS.list) {
+      // 透明锚点铺满全天 09:30~15:00 共 241 分钟，使 fixLeftEdge + fixRightEdge 严格把 09:30 锁在最左、15:00 锁在最右
+      anchorData.push({ time: ts, value: prevClose });
+      const pt = ptByTs.get(ts);
+      if (pt) {
+        priceData.push({ time: ts, value: pt.price });
+        avgData.push({ time: ts, value: pt.avg });
+        volData.push({
+          time: ts,
+          value: pt.vol || 0,
+          color: pt.price >= pt.prevPrice ? palette.upAlpha : palette.downAlpha,
+        });
+      }
+    }
+    const latestPt = pts.length ? pts[pts.length - 1] : null;
+    return { prevClose, ptByTs, yMin, yMax, priceData, avgData, volData, anchorData, latestPt };
+  }
+
+  function renderIntradayLegendBar(ctx, pt) {
+    if (!pt || !ctx) return;
+    const cls = pt.price >= ctx.prevClose ? "up" : "down";
+    const avgPct = ctx.prevClose ? ((pt.avg / ctx.prevClose - 1) * 100) : 0;
+    $("crosshairLegend").innerHTML = [
+      `<span class="lg-item"><strong>${escHtml(ctx.date)} ${escHtml(pt.hhmm)}</strong></span>`,
+      `<span class="lg-item" style="color:${ctx.lineColor}">现价 <strong class="${cls}">${fmtNum(pt.price, 2)} (${fmtPct(pt.pct)})</strong></span>`,
+      `<span class="lg-item" style="color:#f0b90b">均价 ${fmtNum(pt.avg, 2)} (${fmtPct(avgPct)})</span>`,
+      `<span class="lg-item"><span class="lg-k">分时量</span> ${fmtVol(pt.vol)}股</span>`,
+    ].join("");
+    const volBadge = $("subpaneLegends").querySelector(".pane-legend-vals");
+    if (volBadge) {
+      volBadge.innerHTML = `<span>分时成交量 ${fmtVol(pt.vol)}</span>`;
+    }
+  }
+
+  function updateIntradayInPlace(data) {
+    const ctx = state.intradayCtx;
+    if (!ctx || !state.chart) return;
+    const p = chartPalette();
+    const built = buildIntradaySeriesData(data, p);
+    const liveTxt = data.is_live ? `盘中实时 ${data.quote_time} · 5秒无闪烁刷新` : `${data.date} 分时回顾`;
+    $("intradayInfoText").textContent = `${liveTxt} · 昨收 ${fmtNum(built.prevClose, 2)}`;
+
+    ctx.prevClose = built.prevClose;
+    ctx.ptByTs = built.ptByTs;
+    ctx.yMin = built.yMin;
+    ctx.yMax = built.yMax;
+    ctx.latestPt = built.latestPt;
+
+    ctx.priceSeries.setData(built.priceData);
+    ctx.avgSeries.setData(built.avgData);
+    ctx.volSeries.setData(built.volData);
+
+    const activePt = ctx.hoverTs !== null ? (ctx.ptByTs.get(ctx.hoverTs) || ctx.latestPt) : ctx.latestPt;
+    renderIntradayLegendBar(ctx, activePt);
+  }
+
   function renderIntradayChart(data) {
     const mount = $("chartMount");
     const scrollWrap = $("chartScrollWrap");
+    state.intradayCtx = null;
     if (state.chartResizeObs) {
       state.chartResizeObs.disconnect();
       state.chartResizeObs = null;
@@ -1238,34 +1349,26 @@
     $("subpaneLegends").innerHTML = "";
 
     const pts = data.points || [];
-    const prevClose = Number(data.prev_close) || (pts[0]?.price ?? 0);
-    const liveTxt = data.is_live ? `盘中实时 ${data.quote_time} · 15秒自动刷新` : `${data.date} 分时回顾`;
-    $("intradayInfoText").textContent = `${liveTxt} · 昨收 ${fmtNum(prevClose, 2)}`;
+    const p = chartPalette();
+    const built = buildIntradaySeriesData(data, p);
+    const liveTxt = data.is_live ? `盘中实时 ${data.quote_time} · 5秒无闪烁刷新` : `${data.date} 分时回顾`;
+    $("intradayInfoText").textContent = `${liveTxt} · 昨收 ${fmtNum(built.prevClose, 2)}`;
 
     if (!pts.length || typeof LightweightCharts === "undefined") {
       $("crosshairLegend").innerHTML = `<span class="lg-item muted">暂无今日分时成交数据</span>`;
       return;
     }
 
-    const ptBySlot = new Map();
-    const hhmmBySlot = new Map();
-    pts.forEach((pt, idx) => {
-      const slot = idx + 1;
-      hhmmBySlot.set(slot, pt.hhmm);
-      ptBySlot.set(slot, {
-        ...pt,
-        prevPrice: idx > 0 ? pts[idx - 1].price : prevClose,
-      });
-    });
-
-    const p = chartPalette();
     const dark = state.theme !== "light";
+    const totalSlots = INTRADAY_SLOTS.list.length;
     const wrapH = Math.max(280, scrollWrap.clientHeight);
     const plotW = Math.max(260, scrollWrap.clientWidth - 68);
-    const fillSpacing = Math.max(1.5, plotW / Math.max(1, pts.length - 1));
     mount.style.height = wrapH + "px";
 
-    const fmtSlot = (t) => hhmmBySlot.get(Math.round(Number(t))) || "";
+    const fmtTs = (t) => {
+      const hhmm = INTRADAY_SLOTS.byTs.get(Math.round(Number(t))) || "";
+      return hhmm === "11:30" ? "11:30/13:00" : hhmm;
+    };
 
     const chart = LightweightCharts.createChart(mount, {
       autoSize: true,
@@ -1296,33 +1399,56 @@
       },
       timeScale: {
         borderColor: p.border,
+        timeVisible: true,
+        secondsVisible: false,
         fixLeftEdge: true,
         fixRightEdge: true,
         rightOffset: 0,
         minBarSpacing: 0.5,
-        barSpacing: fillSpacing,
-        tickMarkFormatter: (t) => fmtSlot(t),
+        barSpacing: Math.max(1.0, plotW / totalSlots),
+        ignoreWhitespaceIndices: false,
+        tickMarkFormatter: (t) => fmtTs(t),
       },
       localization: {
         locale: "zh-CN",
-        timeFormatter: (t) => fmtSlot(t),
+        timeFormatter: (t) => fmtTs(t),
       },
     });
     state.chart = chart;
-
-    // 对称价格纵轴：以昨收为中心上下等距，还原标准 A 股分时观感
-    let maxDev = prevClose * 0.012;
-    for (const pt of pts) {
-      maxDev = Math.max(maxDev, Math.abs(pt.price - prevClose), Math.abs(pt.avg - prevClose));
-    }
-    const yMin = prevClose - maxDev * 1.12;
-    const yMax = prevClose + maxDev * 1.12;
 
     const lineColor = dark ? "#38bdf8" : "#2563eb";
     const areaTop = dark ? "rgba(56, 189, 248, 0.22)" : "rgba(37, 99, 235, 0.16)";
     const areaBot = dark ? "rgba(56, 189, 248, 0.01)" : "rgba(37, 99, 235, 0.01)";
 
-    const priceSeries = chart.addSeries(
+    const ctx = {
+      code: data.code,
+      date: data.date,
+      prevClose: built.prevClose,
+      ptByTs: built.ptByTs,
+      yMin: built.yMin,
+      yMax: built.yMax,
+      latestPt: built.latestPt,
+      lineColor,
+      hoverTs: null,
+      priceSeries: null,
+      avgSeries: null,
+      volSeries: null,
+    };
+
+    ctx.anchorSeries = chart.addSeries(
+      LightweightCharts.LineSeries,
+      {
+        color: "rgba(0,0,0,0)",
+        lineVisible: false,
+        priceLineVisible: false,
+        lastValueVisible: false,
+        crosshairMarkerVisible: false,
+        autoscaleInfoProvider: () => null,
+      },
+      0
+    );
+
+    ctx.priceSeries = chart.addSeries(
       LightweightCharts.AreaSeries,
       {
         lineColor,
@@ -1330,12 +1456,12 @@
         bottomColor: areaBot,
         lineWidth: 1.8,
         priceFormat: { type: "price", precision: 2, minMove: 0.01 },
-        autoscaleInfoProvider: () => ({ priceRange: { minValue: yMin, maxValue: yMax } }),
+        autoscaleInfoProvider: () => ({ priceRange: { minValue: ctx.yMin, maxValue: ctx.yMax } }),
       },
       0
     );
 
-    const avgSeries = chart.addSeries(
+    ctx.avgSeries = chart.addSeries(
       LightweightCharts.LineSeries,
       {
         color: "#f0b90b",
@@ -1348,7 +1474,7 @@
       0
     );
 
-    const volSeries = chart.addSeries(
+    ctx.volSeries = chart.addSeries(
       LightweightCharts.HistogramSeries,
       {
         priceFormat: { type: "volume" },
@@ -1358,28 +1484,16 @@
       1
     );
 
-    const priceData = [];
-    const avgData = [];
-    const volData = [];
-    for (let idx = 0; idx < pts.length; idx++) {
-      const slot = idx + 1;
-      const pt = ptBySlot.get(slot);
-      priceData.push({ time: slot, value: pt.price });
-      avgData.push({ time: slot, value: pt.avg });
-      volData.push({
-        time: slot,
-        value: pt.vol || 0,
-        color: pt.price >= pt.prevPrice ? p.upAlpha : p.downAlpha,
-      });
-    }
-    priceSeries.setData(priceData);
-    avgSeries.setData(avgData);
-    volSeries.setData(volData);
+    ctx.anchorSeries.setData(built.anchorData);
+    ctx.priceSeries.setData(built.priceData);
+    ctx.avgSeries.setData(built.avgData);
+    ctx.volSeries.setData(built.volData);
+    state.intradayCtx = ctx;
 
     // 昨收虚线基准
-    if (prevClose > 0) {
-      priceSeries.createPriceLine({
-        price: prevClose,
+    if (ctx.prevClose > 0) {
+      ctx.priceSeries.createPriceLine({
+        price: ctx.prevClose,
         color: p.crosshair,
         lineWidth: 1,
         lineStyle: LightweightCharts.LineStyle.Dashed,
@@ -1388,46 +1502,31 @@
       });
     }
 
-    const fitIntradayFull = () => {
+    // 严格锁定 09:30（最左）~ 15:00（最右），右侧自然留出当天未开盘时段空白
+    const fitStandardDay = () => {
       if (!state.chart || state.interval !== "分时") return;
       const ps = state.chart.panes();
       const h = Math.max(280, scrollWrap.clientHeight);
       if (ps.length > 1) ps[0].setHeight(Math.floor(h * 0.72));
-      if (pts.length > 1) {
-        const pw = Math.max(260, scrollWrap.clientWidth - 68);
-        state.chart.timeScale().applyOptions({ barSpacing: Math.max(1.5, pw / (pts.length - 1)) });
-        state.chart.timeScale().setVisibleLogicalRange({ from: 0, to: pts.length - 1 });
-      } else {
-        state.chart.timeScale().fitContent();
-      }
-      positionSubpaneLegends(state.paneSubMap);
+      state.chart.timeScale().fitContent();
+      requestAnimationFrame(() => positionSubpaneLegends(state.paneSubMap));
     };
-    fitIntradayFull();
-
-    const latestPt = pts[pts.length - 1];
-    const renderIntradayLegend = (pt) => {
-      if (!pt) return;
-      const cls = pt.price >= prevClose ? "up" : "down";
-      const avgPct = prevClose ? ((pt.avg / prevClose - 1) * 100) : 0;
-      $("crosshairLegend").innerHTML = [
-        `<span class="lg-item"><strong>${escHtml(data.date)} ${escHtml(pt.hhmm)}</strong></span>`,
-        `<span class="lg-item" style="color:${lineColor}">现价 <strong class="${cls}">${fmtNum(pt.price, 2)} (${fmtPct(pt.pct)})</strong></span>`,
-        `<span class="lg-item" style="color:#f0b90b">均价 ${fmtNum(pt.avg, 2)} (${fmtPct(avgPct)})</span>`,
-        `<span class="lg-item"><span class="lg-k">分时量</span> ${fmtVol(pt.vol)}股</span>`,
-      ].join("");
-      const volBadge = $("subpaneLegends").querySelector(".pane-legend-vals");
-      if (volBadge) {
-        volBadge.innerHTML = `<span>分时成交量 ${fmtVol(pt.vol)}</span>`;
-      }
-    };
+    fitStandardDay();
 
     $("subpaneLegends").innerHTML = `<div class="pane-legend-badge" data-pane="1"><span class="pane-legend-vals"></span></div>`;
     state.paneSubMap = [{ paneIdx: 1, key: "VOL" }];
-    renderIntradayLegend(latestPt);
+    renderIntradayLegendBar(ctx, ctx.latestPt);
 
     chart.subscribeCrosshairMove((param) => {
-      const pt = param && param.time !== undefined ? ptBySlot.get(Math.round(Number(param.time))) : null;
-      renderIntradayLegend(pt || latestPt);
+      if (param && param.time !== undefined) {
+        const ts = Math.round(Number(param.time));
+        const pt = ctx.ptByTs.get(ts);
+        ctx.hoverTs = pt ? ts : null;
+        renderIntradayLegendBar(ctx, pt || ctx.latestPt);
+      } else {
+        ctx.hoverTs = null;
+        renderIntradayLegendBar(ctx, ctx.latestPt);
+      }
     });
 
     state.chartResizeObs = new ResizeObserver(() => {
@@ -1435,12 +1534,12 @@
       state.resizeRaf = requestAnimationFrame(() => {
         if (!state.chart || state.interval !== "分时") return;
         mount.style.height = Math.max(280, scrollWrap.clientHeight) + "px";
-        fitIntradayFull();
+        fitStandardDay();
       });
     });
     state.chartResizeObs.observe(scrollWrap);
-    requestAnimationFrame(fitIntradayFull);
-    setTimeout(fitIntradayFull, 80);
+    requestAnimationFrame(fitStandardDay);
+    setTimeout(fitStandardDay, 80);
   }
 
   async function loadKline(code, name) {
@@ -1545,6 +1644,7 @@
   function renderChart(data) {
     const mount = $("chartMount");
     const scrollWrap = $("chartScrollWrap");
+    state.intradayCtx = null;
     if (state.chartResizeObs) {
       state.chartResizeObs.disconnect();
       state.chartResizeObs = null;

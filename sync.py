@@ -362,7 +362,7 @@ def fetch_kline_history(code, interval="日线", end_str=None):
 _INTRADAY_LOCK = threading.Lock()
 _INTRADAY_CACHE = OrderedDict()
 _INTRADAY_OFFLINE_UNTIL = 0.0
-_INTRADAY_TTL = 10.0  # 10 秒实时缓存，兼顾盘中秒级刷新与防高频限流
+_INTRADAY_TTL = 3.0  # 3 秒实时缓存，配合前端 5 秒原地刷新，贴近 A 股 3 秒快照且防限流
 
 
 def fetch_intraday_minute(code):
