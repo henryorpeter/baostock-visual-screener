@@ -467,16 +467,45 @@ async def api_kline(request):
     name_map = dict(_get_universe_cached())
     name = name_map.get(code, code)
 
-    # 最新日行情卡片摘要（优先用本地日线以保留准确换手率与成交额，无本地则用在线末根兜底）
-    ticker_src = local_frame if not local_frame.empty else ext_frame
-    latest = ticker_src.iloc[-1]
-    prior = ticker_src.iloc[-2].close if len(ticker_src) > 1 else latest.close
-    change = (float(latest.close) / float(prior) - 1.0) * 100.0 if prior else 0.0
-    amp = ((float(latest.high) - float(latest.low)) / float(prior) * 100.0) if prior else 0.0
-    latest_turn = getattr(latest, "turn", None)
-    latest_amt = getattr(latest, "amount", None)
-    if latest_amt is None or (isinstance(latest_amt, float) and math.isnan(latest_amt)):
-        latest_amt = float(latest.close) * float(latest.volume)
+    # 最新日行情卡片摘要：若非历史回测且在线存在更新的盘中/最新实时行情，顶部行情栏自动对齐到最新实时价（避免上面昨收下面盘中打架）
+    today_str = today_dt.strftime("%Y-%m-%d")
+    live_info = None
+    if end_str >= today_str:
+        live_info = await asyncio.to_thread(sync.fetch_intraday_minute, code)
+
+    local_last_date = pd.Timestamp(local_frame.iloc[-1].date).strftime("%Y-%m-%d") if not local_frame.empty else ""
+    use_live_ticker = (
+        live_info is not None
+        and live_info.get("quote") is not None
+        and live_info.get("date", "") >= local_last_date
+        and (live_info.get("is_live") or live_info.get("date", "") > local_last_date)
+    )
+
+    if use_live_ticker:
+        q = live_info["quote"]
+        ticker_date = q["date"]
+        t_open, t_high, t_low, t_close = q["open"], q["high"], q["low"], q["close"]
+        change, amp = q["pctChg"], q["amp"]
+        latest_turn, latest_amt, latest_vol = q["turn"], q["amount"], q["volume"]
+        is_live = bool(q.get("is_live"))
+        quote_time = q.get("quote_time") or ""
+        if live_info.get("name") and name == code:
+            name = live_info["name"]
+    else:
+        ticker_src = local_frame if not local_frame.empty else ext_frame
+        latest = ticker_src.iloc[-1]
+        prior = ticker_src.iloc[-2].close if len(ticker_src) > 1 else latest.close
+        ticker_date = pd.Timestamp(latest.date).strftime("%Y-%m-%d")
+        t_open, t_high, t_low, t_close = latest.open, latest.high, latest.low, latest.close
+        change = (float(latest.close) / float(prior) - 1.0) * 100.0 if prior else 0.0
+        amp = ((float(latest.high) - float(latest.low)) / float(prior) * 100.0) if prior else 0.0
+        latest_turn = getattr(latest, "turn", None)
+        latest_amt = getattr(latest, "amount", None)
+        latest_vol = latest.volume
+        if latest_amt is None or (isinstance(latest_amt, float) and math.isnan(latest_amt)):
+            latest_amt = float(latest.close) * float(latest.volume)
+        is_live = False
+        quote_time = ""
 
     # 全套 14 项指标（不按 180 天截断，保留完整多年历史供左拖/缩放与长周期均线/布林带计算）
     if use_ext:
@@ -529,21 +558,66 @@ async def api_kline(request):
         "bar_count": len(bars),
         "in_watchlist": code in wl_codes,
         "ticker": {
-            "date": pd.Timestamp(latest.date).strftime("%Y-%m-%d"),
-            "open": _clean_num(latest.open, 2),
-            "high": _clean_num(latest.high, 2),
-            "low": _clean_num(latest.low, 2),
-            "close": _clean_num(latest.close, 2),
+            "date": ticker_date,
+            "open": _clean_num(t_open, 2),
+            "high": _clean_num(t_high, 2),
+            "low": _clean_num(t_low, 2),
+            "close": _clean_num(t_close, 2),
             "pctChg": _clean_num(change, 2),
             "amp": _clean_num(amp, 2),
             "turn": _clean_num(latest_turn, 2),
             "amount": _clean_num(latest_amt, 0),
             "amount_str": charts._fmt_amount(latest_amt),
-            "volume_str": charts._fmt_volume(latest.volume),
+            "volume_str": charts._fmt_volume(latest_vol),
             "rsi6": last_bar.get("rsi6"),
             "macd_trend": macd_trend,
+            "is_live": is_live,
+            "quote_time": quote_time,
         },
         "bars": bars,
+    })
+
+
+async def api_intraday(request):
+    """返回单只股票当日实时分时图数据（每分钟现价、分时均价VWAP、分时量及盘口摘要）。"""
+    code = request.path_params["code"].strip()
+    if not _valid_code(code):
+        return JSONResponse({"error": "股票代码格式无效（需如 sh.600519 / sz.000001）"}, status_code=400)
+
+    live = await asyncio.to_thread(sync.fetch_intraday_minute, code)
+    if live is None:
+        return JSONResponse({"error": f"暂无法获取 {code} 的实时分时数据（可能离线或暂不支持该板块）"}, status_code=404)
+
+    name_map = dict(_get_universe_cached())
+    name = live.get("name") or name_map.get(code, code)
+    q = live["quote"]
+    wl_codes = {r[0] for r in db.watchlist_load()}
+    return JSONResponse({
+        "code": code,
+        "name": name,
+        "date": live["date"],
+        "quote_time": live["quote_time"],
+        "is_live": bool(live["is_live"]),
+        "prev_close": _clean_num(live["prev_close"], 2),
+        "in_watchlist": code in wl_codes,
+        "ticker": {
+            "date": q["date"],
+            "open": _clean_num(q["open"], 2),
+            "high": _clean_num(q["high"], 2),
+            "low": _clean_num(q["low"], 2),
+            "close": _clean_num(q["close"], 2),
+            "pctChg": _clean_num(q["pctChg"], 2),
+            "amp": _clean_num(q["amp"], 2),
+            "turn": _clean_num(q["turn"], 2),
+            "amount": _clean_num(q["amount"], 0),
+            "amount_str": charts._fmt_amount(q["amount"]),
+            "volume_str": charts._fmt_volume(q["volume"]),
+            "rsi6": None,
+            "macd_trend": f"昨收 {_clean_num(live['prev_close'], 2)}",
+            "is_live": bool(live["is_live"]),
+            "quote_time": live["quote_time"],
+        },
+        "points": live["points"],
     })
 
 
@@ -664,6 +738,7 @@ routes = [
     Route("/api/screen", api_screen, methods=["POST"]),
     Route("/api/screen/stream", api_screen_stream, methods=["POST"]),
     Route("/api/kline/{code:path}", api_kline),
+    Route("/api/intraday/{code:path}", api_intraday),
     Route("/api/watchlist", api_watchlist_list, methods=["GET"]),
     Route("/api/watchlist", api_watchlist_add, methods=["POST"]),
     Route("/api/watchlist/{code:path}", api_watchlist_delete, methods=["DELETE"]),

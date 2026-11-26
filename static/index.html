@@ -4,9 +4,9 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>KLineRadar · A股选股与看盘终端</title>
-  <link rel="stylesheet" href="/static/app.css?v=12" />
+  <link rel="stylesheet" href="/static/app.css?v=14" />
   <script src="/static/lightweight-charts.standalone.production.js" defer></script>
-  <script src="/static/app.js?v=12" defer></script>
+  <script src="/static/app.js?v=14" defer></script>
 </head>
 <body>
   <!-- ==================== TOP BAR ==================== -->
@@ -227,7 +227,10 @@
               <button class="btn-star" id="btnToggleWatchlist" type="button" title="加入 / 移出自选池">☆</button>
               <div class="ticker-title-wrap">
                 <span class="ticker-name" id="tickerName">--</span>
-                <span class="ticker-code" id="tickerCode">--</span>
+                <div class="ticker-code-row">
+                  <span class="ticker-code" id="tickerCode">--</span>
+                  <span class="live-badge hidden" id="tickerLiveBadge"></span>
+                </div>
               </div>
               <div class="ticker-price-wrap">
                 <span class="ticker-price" id="tickerPrice">--</span>
@@ -249,26 +252,35 @@
           <!-- Chart Indicator Toolbar -->
           <div class="chart-toolbar" id="chartToolbar">
             <div class="tb-group" id="intervalGroup">
+              <button class="tb-btn" data-interval="分时" type="button">分时</button>
               <button class="tb-btn active" data-interval="日线" type="button">日线</button>
               <button class="tb-btn" data-interval="周线" type="button">周线</button>
               <button class="tb-btn" data-interval="月线" type="button">月线</button>
             </div>
 
-            <span class="v-sep"></span>
+            <div class="tb-kline-inds" id="klineIndWrap">
+              <span class="v-sep"></span>
 
-            <div class="tb-group">
-              <span class="tb-label">主图</span>
-              <div class="tb-chips" id="overlayChips"></div>
+              <div class="tb-group">
+                <span class="tb-label">主图</span>
+                <div class="tb-chips" id="overlayChips"></div>
+              </div>
+
+              <span class="v-sep"></span>
+
+              <div class="tb-group">
+                <span class="tb-label">副图</span>
+                <div class="tb-chips" id="subChips"></div>
+              </div>
             </div>
 
-            <span class="v-sep"></span>
-
-            <div class="tb-group">
-              <span class="tb-label">副图</span>
-              <div class="tb-chips" id="subChips"></div>
+            <div class="tb-intraday-meta hidden" id="intradayToolbarMeta">
+              <span class="v-sep"></span>
+              <span class="tb-range-meta mono" id="intradayInfoText">当日实时分时 · 蓝线现价 / 黄线均价</span>
+              <button class="tb-reset" id="btnRefreshIntraday" type="button" title="立即刷新实时分时">刷新</button>
             </div>
 
-            <div class="tb-end">
+            <div class="tb-end" id="klineEndWrap">
               <span class="tb-scroll-hint hidden" id="chartScrollHint">滚轮上下 · Ctrl+滚轮缩放</span>
               <span class="tb-range-meta mono" id="chartRangeMeta" title="向左拖动或缩放可查看全部历史"></span>
               <button class="tb-reset hidden" id="btnToggleSubLayout" type="button" title="在「展开滚动」与「一屏全览」间切换多副图布局">一屏全览</button>

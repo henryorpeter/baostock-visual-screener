@@ -344,6 +344,7 @@ def test_web_server_api_end_to_end(isolated_db, monkeypatch):
 
     # 离线确定性测试：禁用外网拉取，验证本地 SQLite 回退与全部端点
     monkeypatch.setattr(sync, "fetch_kline_history", lambda *a, **k: None)
+    monkeypatch.setattr(sync, "fetch_intraday_minute", lambda *a, **k: None)
 
     df = _make_ohlcv(n=130, seed=17, trend=0.002, code="sh.600519")
     df.iloc[-1, df.columns.get_loc("open")] = df["close"].iloc[-2] * 1.01
@@ -531,6 +532,71 @@ def test_web_server_security_hardening(isolated_db):
     # 5. Server酱 SendKey 路径注入校验
     with pytest.raises(ValueError):
         engine.push_wechat(pd.DataFrame([{"代码": "sh.600519", "名称": "A", "收盘": 10.0, "涨跌幅%": 1.0}]), "../../evil?x=1", ["测试"])
+
+
+def test_intraday_minute_api_and_live_ticker_sync(isolated_db, monkeypatch):
+    import json
+    import web_server
+
+    # 模拟本地库只存到前一天，而今日盘中腾讯分时已返回新价格 14.47
+    df_local = _make_ohlcv(n=40, seed=5, start="2026-09-01", code="sh.600722")
+    db._cache_write(df_local)
+    db.cache_universe_save(pd.DataFrame([{"code": "sh.600722", "code_name": "金牛化工"}]))
+    web_server._get_universe_cached(force=True)
+
+    today_compact = datetime.now().strftime("%Y%m%d")
+    today_iso = datetime.now().strftime("%Y-%m-%d")
+    qt_arr = [""] * 40
+    qt_arr[1] = "金牛化工"
+    qt_arr[3] = "14.47"
+    qt_arr[4] = "13.15"
+    qt_arr[5] = "13.00"
+    qt_arr[30] = today_compact + "102624"
+    qt_arr[32] = "10.04"
+    qt_arr[33] = "14.47"
+    qt_arr[34] = "12.88"
+    qt_arr[37] = "145838"
+    qt_arr[38] = "15.33"
+
+    mock_payload = {
+        "data": {
+            "sh600722": {
+                "data": {
+                    "date": today_compact,
+                    "data": [
+                        "0930 13.00 1000 1300000.00",
+                        "0931 14.00 2000 2700000.00",
+                        "0932 14.47 3000 4147000.00",
+                    ],
+                },
+                "qt": {"sh600722": qt_arr},
+            }
+        }
+    }
+    sync._INTRADAY_CACHE.clear()
+    sync._INTRADAY_OFFLINE_UNTIL = 0.0
+    monkeypatch.setattr(sync, "_https_json", lambda url, params, referer, timeout=12, retries=3: mock_payload)
+
+    # 1. /api/intraday 返回完整分时点 + 精确 VWAP 均价 + 分时增量成交量
+    st, _, raw = _asgi_call(web_server.web_app, "GET", "/api/intraday/sh.600722")
+    assert st == 200
+    intra = json.loads(raw)
+    assert intra["date"] == today_iso and intra["prev_close"] == 13.15
+    assert len(intra["points"]) == 3
+    assert intra["points"][1]["vol"] == 100000  # 2000-1000 手 = 100,000 股
+    assert abs(intra["points"][1]["avg"] - 13.5) < 0.01  # 2700000 / 200000 = 13.50
+    assert intra["ticker"]["close"] == 14.47 and intra["ticker"]["turn"] == 15.33
+
+    # 2. /api/intraday 非法代码拦截
+    st, _, _ = _asgi_call(web_server.web_app, "GET", "/api/intraday/bad_code")
+    assert st == 400
+
+    # 3. /api/kline 在今日看盘时自动将顶部 ticker 对齐到 14.47（不再停在旧缓存收盘价）
+    monkeypatch.setattr(sync, "fetch_kline_history", lambda *a, **k: None)
+    st, _, raw = _asgi_call(web_server.web_app, "GET", "/api/kline/sh.600722", f"end={today_iso}")
+    assert st == 200
+    kl = json.loads(raw)
+    assert kl["ticker"]["close"] == 14.47 and kl["ticker"]["date"] == today_iso
 
 
 # ==================== 6. Legacy AppTest E2E smoke tests ====================

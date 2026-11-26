@@ -359,6 +359,164 @@ def fetch_kline_history(code, interval="日线", end_str=None):
     return out if not out.empty else None
 
 
+_INTRADAY_LOCK = threading.Lock()
+_INTRADAY_CACHE = OrderedDict()
+_INTRADAY_OFFLINE_UNTIL = 0.0
+_INTRADAY_TTL = 10.0  # 10 秒实时缓存，兼顾盘中秒级刷新与防高频限流
+
+
+def fetch_intraday_minute(code):
+    """按需拉取单只 A 股当日实时分时（价格/均价VWAP/分时量）与盘口快照（腾讯 minute/query）。"""
+    global _INTRADAY_OFFLINE_UNTIL
+    if not isinstance(code, str) or not re.fullmatch(r"(?:sh|sz)\.\d{6}", code):
+        return None
+    market, symbol = code.split(".", 1)
+    sym = f"{market}{symbol}"
+
+    now = time.monotonic()
+    with _INTRADAY_LOCK:
+        cached = _INTRADAY_CACHE.get(code)
+        if cached is not None and (now - cached[0]) < _INTRADAY_TTL:
+            _INTRADAY_CACHE.move_to_end(code)
+            return cached[1]
+        if now < _INTRADAY_OFFLINE_UNTIL:
+            return None
+
+    try:
+        payload = _https_json(
+            "https://web.ifzq.gtimg.cn/appstock/app/minute/query",
+            {"code": sym},
+            "https://gu.qq.com/",
+            timeout=4,
+            retries=1,
+        )
+    except Exception:
+        with _INTRADAY_LOCK:
+            _INTRADAY_OFFLINE_UNTIL = time.monotonic() + 30.0
+        return None
+
+    node = (payload.get("data") or {}).get(sym) or {}
+    mnode = node.get("data") or {}
+    raw_date = str(mnode.get("date") or "").strip()
+    if len(raw_date) == 8 and raw_date.isdigit():
+        trade_date = f"{raw_date[:4]}-{raw_date[4:6]}-{raw_date[6:8]}"
+    else:
+        trade_date = date.today().strftime("%Y-%m-%d")
+
+    qt = (node.get("qt") or {}).get(sym) or []
+
+    def _qt_float(idx):
+        if len(qt) <= idx:
+            return None
+        try:
+            v = float(qt[idx])
+            return v if np.isfinite(v) else None
+        except (TypeError, ValueError):
+            return None
+
+    qt_name = str(qt[1]).strip() if len(qt) > 1 and qt[1] else ""
+    price_now = _qt_float(3)
+    prev_close = _qt_float(4)
+    open_p = _qt_float(5)
+    pct_chg = _qt_float(32)
+    high_p = _qt_float(33)
+    low_p = _qt_float(34)
+    amt_wan = _qt_float(37)
+    turn = _qt_float(38)
+    raw_ts = str(qt[30]).strip() if len(qt) > 30 and qt[30] else ""
+    quote_time = f"{raw_ts[8:10]}:{raw_ts[10:12]}:{raw_ts[12:14]}" if len(raw_ts) >= 14 else ""
+
+    # 科创板(688/689)成交量单位已是股，其余板块单位为手(×100转股)
+    vol_mult = 1.0 if symbol.startswith(("688", "689")) else 100.0
+    raw_mins = mnode.get("data") or []
+    points = []
+    prev_cum_shares = 0.0
+    for row in raw_mins:
+        parts = str(row).split()
+        if len(parts) < 3:
+            continue
+        hhmm_raw = parts[0]
+        if len(hhmm_raw) != 4 or not hhmm_raw.isdigit():
+            continue
+        try:
+            px = float(parts[1])
+            cum_vol_raw = float(parts[2])
+            cum_amt = float(parts[3]) if len(parts) >= 4 else None
+        except ValueError:
+            continue
+        if px <= 0:
+            continue
+        cum_shares = cum_vol_raw * vol_mult
+        bar_vol = max(0.0, cum_shares - prev_cum_shares)
+        prev_cum_shares = cum_shares
+        avg_px = px
+        if cum_amt is not None and cum_shares > 0:
+            cand = cum_amt / cum_shares
+            if 0.5 * px <= cand <= 2.0 * px:
+                avg_px = cand
+        pct_pt = ((px / prev_close) - 1.0) * 100.0 if prev_close and prev_close > 0 else 0.0
+        points.append({
+            "hhmm": f"{hhmm_raw[:2]}:{hhmm_raw[2:]}",
+            "price": round(px, 3),
+            "avg": round(avg_px, 3),
+            "vol": round(bar_vol, 0),
+            "pct": round(pct_pt, 2),
+        })
+
+    if not points and price_now is None:
+        return None
+
+    if price_now is None and points:
+        price_now = points[-1]["price"]
+    if prev_close is None or prev_close <= 0:
+        prev_close = open_p or price_now
+    if open_p is None and points:
+        open_p = points[0]["price"]
+    if high_p is None and points:
+        high_p = max(p["price"] for p in points)
+    if low_p is None and points:
+        low_p = min(p["price"] for p in points)
+    if pct_chg is None and prev_close and price_now:
+        pct_chg = (price_now / prev_close - 1.0) * 100.0
+    amp = ((high_p - low_p) / prev_close * 100.0) if (high_p is not None and low_p is not None and prev_close) else 0.0
+    amount_yuan = amt_wan * 10000.0 if amt_wan is not None else (prev_cum_shares * (price_now or 0.0))
+
+    now_dt = datetime.now()
+    today_s = now_dt.strftime("%Y-%m-%d")
+    hm = now_dt.strftime("%H:%M")
+    is_live = (trade_date == today_s) and (now_dt.weekday() < 5) and ("09:15" <= hm <= "15:05")
+
+    res = {
+        "code": code,
+        "name": qt_name,
+        "date": trade_date,
+        "quote_time": quote_time or (points[-1]["hhmm"] if points else ""),
+        "is_live": is_live,
+        "prev_close": round(prev_close, 3) if prev_close is not None else None,
+        "quote": {
+            "date": trade_date,
+            "open": open_p,
+            "high": high_p,
+            "low": low_p,
+            "close": price_now,
+            "pctChg": pct_chg,
+            "amp": amp,
+            "turn": turn,
+            "amount": amount_yuan,
+            "volume": prev_cum_shares,
+            "is_live": is_live,
+            "quote_time": quote_time or (points[-1]["hhmm"] if points else ""),
+        },
+        "points": points,
+    }
+    with _INTRADAY_LOCK:
+        _INTRADAY_CACHE[code] = (now, res)
+        _INTRADAY_CACHE.move_to_end(code)
+        while len(_INTRADAY_CACHE) > 64:
+            _INTRADAY_CACHE.popitem(last=False)
+    return res
+
+
 def _history_eastmoney(code, start, end, name=""):
     """东方财富前复权日线接口：返回含换手率、成交额的完整日线（所有板块成交量均以手为单位）。"""
     market, symbol = code.split(".")

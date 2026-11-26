@@ -45,6 +45,8 @@
     subs: new Set(["VOL", "MACD"]),
     compactSubs: false,
     klineData: null,
+    intradayData: null,
+    intradayTimer: null,
     barByTime: new Map(),
     prevCloseByTime: new Map(),
     chart: null,
@@ -160,7 +162,8 @@
         },
       });
       // Re-render candlesticks/histograms cleanly with theme-adjusted up/down colors
-      if (state.klineData) renderChart(state.klineData);
+      if (state.interval === "分时" && state.intradayData) renderIntradayChart(state.intradayData);
+      else if (state.klineData) renderChart(state.klineData);
     }
   }
 
@@ -358,7 +361,7 @@
       runScreen();
     });
 
-    // Intervals
+    // Intervals (分时 / 日线 / 周线 / 月线)
     $("intervalGroup").addEventListener("click", (e) => {
       const btn = e.target.closest(".tb-btn");
       if (!btn || btn.dataset.interval === state.interval) return;
@@ -366,7 +369,20 @@
       $("intervalGroup").querySelectorAll(".tb-btn").forEach((b) => {
         b.classList.toggle("active", b === btn);
       });
-      if (state.currentCode) loadKline(state.currentCode, state.currentName);
+      syncToolbarModeUI();
+      if (state.currentCode) {
+        if (state.interval === "分时") loadIntraday(state.currentCode, state.currentName, false);
+        else {
+          stopIntradayPolling();
+          loadKline(state.currentCode, state.currentName);
+        }
+      }
+    });
+
+    $("btnRefreshIntraday").addEventListener("click", () => {
+      if (state.currentCode && state.interval === "分时") {
+        loadIntraday(state.currentCode, state.currentName, false);
+      }
     });
 
     $("btnResetZoom").addEventListener("click", () => {
@@ -1137,19 +1153,294 @@
     });
   }
 
-  // ==================== OPEN STOCK & K-LINE CHART ====================
+  // ==================== OPEN STOCK & K-LINE / INTRADAY CHART ====================
+  function syncToolbarModeUI() {
+    const isMin = state.interval === "分时";
+    $("klineIndWrap").classList.toggle("hidden", isMin);
+    $("klineEndWrap").classList.toggle("hidden", isMin);
+    $("intradayToolbarMeta").classList.toggle("hidden", !isMin);
+  }
+
+  function stopIntradayPolling() {
+    if (state.intradayTimer) {
+      clearInterval(state.intradayTimer);
+      state.intradayTimer = null;
+    }
+  }
+
+  function startIntradayPolling() {
+    stopIntradayPolling();
+    state.intradayTimer = setInterval(() => {
+      if (
+        state.interval === "分时" &&
+        state.view === "terminal" &&
+        state.currentCode &&
+        !document.hidden &&
+        state.intradayData?.is_live
+      ) {
+        loadIntraday(state.currentCode, state.currentName, true);
+      }
+    }, 15000);
+  }
+
   async function openStock(code, name) {
     state.currentCode = code;
     state.currentName = name || code;
     $("emptyStage").classList.add("hidden");
     $("chartStage").classList.remove("hidden");
+    syncToolbarModeUI();
 
     // Highlight active row without re-rendering whole dock DOM
     $("dockList").querySelectorAll(".stock-row").forEach((el) => {
       el.classList.toggle("active", el.dataset.code === code);
     });
     updateWatchlistStarUI();
-    await loadKline(code, name);
+    if (state.interval === "分时") {
+      await loadIntraday(code, name, false);
+    } else {
+      stopIntradayPolling();
+      await loadKline(code, name);
+    }
+  }
+
+  async function loadIntraday(code, name, silent = false) {
+    const seq = ++state.klineReqSeq;
+    if (!silent) $("chartLoading").classList.remove("hidden");
+
+    try {
+      const data = await apiJson(`/api/intraday/${encodeURIComponent(code)}`);
+      if (seq !== state.klineReqSeq || state.interval !== "分时") return;
+      state.intradayData = data;
+      state.currentName = data.name || name || code;
+      renderTickerStrip(data);
+      renderIntradayChart(data);
+      if (data.is_live) startIntradayPolling();
+      else stopIntradayPolling();
+    } catch (err) {
+      if (seq === state.klineReqSeq && !silent) showToast(err.message, true);
+    } finally {
+      if (seq === state.klineReqSeq && !silent) $("chartLoading").classList.add("hidden");
+    }
+  }
+
+  function renderIntradayChart(data) {
+    const mount = $("chartMount");
+    const scrollWrap = $("chartScrollWrap");
+    if (state.chartResizeObs) {
+      state.chartResizeObs.disconnect();
+      state.chartResizeObs = null;
+    }
+    if (state.chart) {
+      state.chart.remove();
+      state.chart = null;
+    }
+    mount.innerHTML = "";
+    $("subpaneLegends").innerHTML = "";
+
+    const pts = data.points || [];
+    const prevClose = Number(data.prev_close) || (pts[0]?.price ?? 0);
+    const liveTxt = data.is_live ? `盘中实时 ${data.quote_time} · 15秒自动刷新` : `${data.date} 分时回顾`;
+    $("intradayInfoText").textContent = `${liveTxt} · 昨收 ${fmtNum(prevClose, 2)}`;
+
+    if (!pts.length || typeof LightweightCharts === "undefined") {
+      $("crosshairLegend").innerHTML = `<span class="lg-item muted">暂无今日分时成交数据</span>`;
+      return;
+    }
+
+    const ptBySlot = new Map();
+    const hhmmBySlot = new Map();
+    pts.forEach((pt, idx) => {
+      const slot = idx + 1;
+      hhmmBySlot.set(slot, pt.hhmm);
+      ptBySlot.set(slot, {
+        ...pt,
+        prevPrice: idx > 0 ? pts[idx - 1].price : prevClose,
+      });
+    });
+
+    const p = chartPalette();
+    const dark = state.theme !== "light";
+    const wrapH = Math.max(280, scrollWrap.clientHeight);
+    const plotW = Math.max(260, scrollWrap.clientWidth - 68);
+    const fillSpacing = Math.max(1.5, plotW / Math.max(1, pts.length - 1));
+    mount.style.height = wrapH + "px";
+
+    const fmtSlot = (t) => hhmmBySlot.get(Math.round(Number(t))) || "";
+
+    const chart = LightweightCharts.createChart(mount, {
+      autoSize: true,
+      layout: {
+        background: { color: p.bg },
+        textColor: p.text,
+        fontSize: 11,
+        fontFamily: "'Inter', -apple-system, 'PingFang SC', 'Microsoft YaHei', sans-serif",
+        attributionLogo: false,
+        panes: {
+          enableResize: true,
+          separatorColor: p.sep,
+          separatorHoverColor: p.sepHover,
+        },
+      },
+      grid: {
+        vertLines: { color: p.grid },
+        horzLines: { color: p.grid },
+      },
+      crosshair: {
+        mode: LightweightCharts.CrosshairMode.Normal,
+        vertLine: { color: p.crosshair, width: 1, style: LightweightCharts.LineStyle.Dashed, labelBackgroundColor: p.labelBg },
+        horzLine: { color: p.crosshair, width: 1, style: LightweightCharts.LineStyle.Dashed, labelBackgroundColor: p.labelBg },
+      },
+      rightPriceScale: {
+        borderColor: p.border,
+        scaleMargins: { top: 0.08, bottom: 0.08 },
+      },
+      timeScale: {
+        borderColor: p.border,
+        fixLeftEdge: true,
+        fixRightEdge: true,
+        rightOffset: 0,
+        minBarSpacing: 0.5,
+        barSpacing: fillSpacing,
+        tickMarkFormatter: (t) => fmtSlot(t),
+      },
+      localization: {
+        locale: "zh-CN",
+        timeFormatter: (t) => fmtSlot(t),
+      },
+    });
+    state.chart = chart;
+
+    // 对称价格纵轴：以昨收为中心上下等距，还原标准 A 股分时观感
+    let maxDev = prevClose * 0.012;
+    for (const pt of pts) {
+      maxDev = Math.max(maxDev, Math.abs(pt.price - prevClose), Math.abs(pt.avg - prevClose));
+    }
+    const yMin = prevClose - maxDev * 1.12;
+    const yMax = prevClose + maxDev * 1.12;
+
+    const lineColor = dark ? "#38bdf8" : "#2563eb";
+    const areaTop = dark ? "rgba(56, 189, 248, 0.22)" : "rgba(37, 99, 235, 0.16)";
+    const areaBot = dark ? "rgba(56, 189, 248, 0.01)" : "rgba(37, 99, 235, 0.01)";
+
+    const priceSeries = chart.addSeries(
+      LightweightCharts.AreaSeries,
+      {
+        lineColor,
+        topColor: areaTop,
+        bottomColor: areaBot,
+        lineWidth: 1.8,
+        priceFormat: { type: "price", precision: 2, minMove: 0.01 },
+        autoscaleInfoProvider: () => ({ priceRange: { minValue: yMin, maxValue: yMax } }),
+      },
+      0
+    );
+
+    const avgSeries = chart.addSeries(
+      LightweightCharts.LineSeries,
+      {
+        color: "#f0b90b",
+        lineWidth: 1.3,
+        priceLineVisible: false,
+        lastValueVisible: false,
+        crosshairMarkerVisible: false,
+        priceFormat: { type: "price", precision: 2, minMove: 0.01 },
+      },
+      0
+    );
+
+    const volSeries = chart.addSeries(
+      LightweightCharts.HistogramSeries,
+      {
+        priceFormat: { type: "volume" },
+        priceLineVisible: false,
+        lastValueVisible: false,
+      },
+      1
+    );
+
+    const priceData = [];
+    const avgData = [];
+    const volData = [];
+    for (let idx = 0; idx < pts.length; idx++) {
+      const slot = idx + 1;
+      const pt = ptBySlot.get(slot);
+      priceData.push({ time: slot, value: pt.price });
+      avgData.push({ time: slot, value: pt.avg });
+      volData.push({
+        time: slot,
+        value: pt.vol || 0,
+        color: pt.price >= pt.prevPrice ? p.upAlpha : p.downAlpha,
+      });
+    }
+    priceSeries.setData(priceData);
+    avgSeries.setData(avgData);
+    volSeries.setData(volData);
+
+    // 昨收虚线基准
+    if (prevClose > 0) {
+      priceSeries.createPriceLine({
+        price: prevClose,
+        color: p.crosshair,
+        lineWidth: 1,
+        lineStyle: LightweightCharts.LineStyle.Dashed,
+        axisLabelVisible: true,
+        title: "昨收",
+      });
+    }
+
+    const fitIntradayFull = () => {
+      if (!state.chart || state.interval !== "分时") return;
+      const ps = state.chart.panes();
+      const h = Math.max(280, scrollWrap.clientHeight);
+      if (ps.length > 1) ps[0].setHeight(Math.floor(h * 0.72));
+      if (pts.length > 1) {
+        const pw = Math.max(260, scrollWrap.clientWidth - 68);
+        state.chart.timeScale().applyOptions({ barSpacing: Math.max(1.5, pw / (pts.length - 1)) });
+        state.chart.timeScale().setVisibleLogicalRange({ from: 0, to: pts.length - 1 });
+      } else {
+        state.chart.timeScale().fitContent();
+      }
+      positionSubpaneLegends(state.paneSubMap);
+    };
+    fitIntradayFull();
+
+    const latestPt = pts[pts.length - 1];
+    const renderIntradayLegend = (pt) => {
+      if (!pt) return;
+      const cls = pt.price >= prevClose ? "up" : "down";
+      const avgPct = prevClose ? ((pt.avg / prevClose - 1) * 100) : 0;
+      $("crosshairLegend").innerHTML = [
+        `<span class="lg-item"><strong>${escHtml(data.date)} ${escHtml(pt.hhmm)}</strong></span>`,
+        `<span class="lg-item" style="color:${lineColor}">现价 <strong class="${cls}">${fmtNum(pt.price, 2)} (${fmtPct(pt.pct)})</strong></span>`,
+        `<span class="lg-item" style="color:#f0b90b">均价 ${fmtNum(pt.avg, 2)} (${fmtPct(avgPct)})</span>`,
+        `<span class="lg-item"><span class="lg-k">分时量</span> ${fmtVol(pt.vol)}股</span>`,
+      ].join("");
+      const volBadge = $("subpaneLegends").querySelector(".pane-legend-vals");
+      if (volBadge) {
+        volBadge.innerHTML = `<span>分时成交量 ${fmtVol(pt.vol)}</span>`;
+      }
+    };
+
+    $("subpaneLegends").innerHTML = `<div class="pane-legend-badge" data-pane="1"><span class="pane-legend-vals"></span></div>`;
+    state.paneSubMap = [{ paneIdx: 1, key: "VOL" }];
+    renderIntradayLegend(latestPt);
+
+    chart.subscribeCrosshairMove((param) => {
+      const pt = param && param.time !== undefined ? ptBySlot.get(Math.round(Number(param.time))) : null;
+      renderIntradayLegend(pt || latestPt);
+    });
+
+    state.chartResizeObs = new ResizeObserver(() => {
+      cancelAnimationFrame(state.resizeRaf);
+      state.resizeRaf = requestAnimationFrame(() => {
+        if (!state.chart || state.interval !== "分时") return;
+        mount.style.height = Math.max(280, scrollWrap.clientHeight) + "px";
+        fitIntradayFull();
+      });
+    });
+    state.chartResizeObs.observe(scrollWrap);
+    requestAnimationFrame(fitIntradayFull);
+    setTimeout(fitIntradayFull, 80);
   }
 
   async function loadKline(code, name) {
@@ -1179,6 +1470,17 @@
     $("tickerName").textContent = data.name || data.code;
     $("tickerCode").textContent = data.code;
 
+    const liveEl = $("tickerLiveBadge");
+    if (liveEl) {
+      if (t.is_live) {
+        const hhmm = t.quote_time ? t.quote_time.slice(0, 5) : "";
+        liveEl.textContent = hhmm ? `盘中 ${hhmm}` : "盘中实时";
+        liveEl.classList.remove("hidden");
+      } else {
+        liveEl.classList.add("hidden");
+      }
+    }
+
     const pEl = $("tickerPrice");
     pEl.textContent = fmtNum(t.close, 2);
     pEl.className = "ticker-price mono " + pctClass(t.pctChg);
@@ -1191,15 +1493,27 @@
 
     const turnStr = t.turn !== null && t.turn !== undefined ? `${fmtNum(t.turn, 2)}%` : "--";
     const rsiStr = t.rsi6 !== null && t.rsi6 !== undefined ? fmtNum(t.rsi6, 1) : "--";
-    const metrics = [
-      ["开", fmtNum(t.open, 2)],
-      ["高", fmtNum(t.high, 2)],
-      ["低", fmtNum(t.low, 2)],
-      ["换手", turnStr],
-      ["成交额", t.amount_str || "--"],
-      ["RSI(6)", rsiStr],
-      ["MACD", t.macd_trend || "--"],
-    ];
+    const ampStr = t.amp !== null && t.amp !== undefined ? `${fmtNum(t.amp, 2)}%` : "--";
+    const metrics =
+      state.interval === "分时"
+        ? [
+            ["开", fmtNum(t.open, 2)],
+            ["高", fmtNum(t.high, 2)],
+            ["低", fmtNum(t.low, 2)],
+            ["振幅", ampStr],
+            ["换手", turnStr],
+            ["成交额", t.amount_str || "--"],
+            ["昨收", fmtNum(data.prev_close, 2)],
+          ]
+        : [
+            ["开", fmtNum(t.open, 2)],
+            ["高", fmtNum(t.high, 2)],
+            ["低", fmtNum(t.low, 2)],
+            ["换手", turnStr],
+            ["成交额", t.amount_str || "--"],
+            ["RSI(6)", rsiStr],
+            ["MACD", t.macd_trend || "--"],
+          ];
     $("tickerStats").innerHTML = metrics
       .map(
         ([k, v]) => `<div class="tm-item"><span class="tm-label">${k}</span><span class="tm-val mono">${escHtml(v)}</span></div>`
