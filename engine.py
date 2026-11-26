@@ -629,7 +629,7 @@ def _format_tdx_ebk(codes):
 
 
 def _format_plain_codes(codes):
-    """导出纯 6 位股票代码（适配同花顺 / 东方财富自选股批量粘贴导入）。"""
+    """导出纯 6 位股票代码（适配主流看盘软件自选股批量粘贴导入）。"""
     syms = [code.split(".", 1)[1] if "." in code else code for code in dict.fromkeys(codes)]
     return "\n".join(syms)
 
@@ -649,7 +649,7 @@ def push_wechat(result, sendkey, strategy_names):
         lines.append(f"{row['代码']} {row['名称']} 收盘 {row['收盘']:.2f} 涨跌 {row['涨跌幅%']:.2f}%")
     response = requests.post(
         f"https://sctapi.ftqq.com/{key}.send",
-        data={"title": f"Baostock选股 {date.today():%Y-%m-%d}", "desp": "\n".join(lines)},
+        data={"title": f"KLineRadar选股 {date.today():%Y-%m-%d}", "desp": "\n".join(lines)},
         timeout=15,
     )
     response.raise_for_status()

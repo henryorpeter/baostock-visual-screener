@@ -401,7 +401,7 @@
       <div class="page-head">
         <div>
           <h2 class="page-title">本地行情数据库与增量同步</h2>
-          <p class="page-sub">全市场日线保存在本地 SQLite，断网可用；收盘后支持自动增量补齐，多源自动容灾</p>
+          <p class="page-sub">全市场日线保存在本地 SQLite，断网可用；交易日收盘后支持自动增量补齐</p>
         </div>
         <button class="btn-primary" id="btnManualSync" type="button">立即增量同步</button>
       </div>
@@ -453,7 +453,6 @@
             </label>
             <button class="btn-ghost" id="btnSaveSyncConfig" type="button">保存设置</button>
           </div>
-          <div class="sync-note">数据源自动容灾顺序：东方财富 / 腾讯财经 / 新浪前复权 / Baostock，自动剔除退市股</div>
           <div class="sync-note mono" id="cacheDbPath"></div>
         </div>
       </div>

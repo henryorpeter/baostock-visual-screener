@@ -64,7 +64,7 @@ def _run_update_action(start, end):
             "failed": update_stats.get("failed", 0),
             "snapshot_updated": update_stats.get("snapshot_updated", 0),
             "ex_div": update_stats.get("ex_div", 0),
-            "source": update_stats.get("source", "腾讯批量快照"),
+            "source": update_stats.get("source", "批量增量日更"),
             "status": "warning" if update_stats.get("failed") else "success",
         }, ensure_ascii=False))
 
@@ -868,7 +868,6 @@ def main():
                 {"项目": "已缓存标的", "数值": f"{local_status['stocks']:,} 只"},
                 {"项目": "日线总行数", "数值": f"{local_status['rows']:,} 条"},
                 {"项目": "起止日期", "数值": f"{local_status['earliest'] or '暂无'} ~ {local_status['newest'] or '暂无'}"},
-                {"项目": "容灾链路", "数值": "腾讯批量快照 → 东财 / 腾讯 / 新浪前复权 → Baostock"},
             ])
             st.dataframe(info_df, width="stretch", hide_index=True)
 

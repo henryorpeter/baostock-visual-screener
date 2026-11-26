@@ -1,4 +1,4 @@
-"""全市场行情同步引擎：交易日预检、腾讯批量截面、东财/腾讯/新浪三级并发回补、Baostock 兜底与收盘自动调度。"""
+"""全市场行情同步引擎：交易日预检、批量截面日更、历史并发回补与收盘自动调度。"""
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
@@ -203,9 +203,9 @@ def _fetch_stock_list(day):
 
     try:
         frame = _tencent_stock_list()
-        source = "腾讯批量接口"
+        source = "在线行情列表"
     except Exception as qq_error:
-        errors.append(f"腾讯列表失败：{qq_error}")
+        errors.append(f"列表接口失败：{qq_error}")
 
     if frame.empty and BAOSTOCK_AVAILABLE is not False:
         def run():
@@ -218,18 +218,18 @@ def _fetch_stock_list(day):
             return pd.DataFrame(), ""
         try:
             frame, actual_day = _query(run)
-            source = "Baostock"
+            source = "备用行情列表"
         except Exception as bs_error:
             BAOSTOCK_AVAILABLE = False
-            errors.append(f"Baostock 失败：{bs_error}")
+            errors.append(f"备用列表失败：{bs_error}")
 
     if frame.empty:
         try:
             frame = _tonghuashun_stock_list()
-            source = "同花顺 HTTPS"
+            source = "扩展行情列表"
             actual_day = day
         except Exception as ths_error:
-            errors.append(f"同花顺备用列表失败：{ths_error}")
+            errors.append(f"扩展列表失败：{ths_error}")
             raise RuntimeError("；".join(errors)) from ths_error
 
     if frame.empty:
@@ -1009,7 +1009,7 @@ def update_cache(codes, start, end, progress):
                     with em_lock:
                         tx_fail_streak[0] += 1
             if skip_sn:
-                raise RuntimeError("东财/腾讯/新浪历史接口均已触发熔断")
+                raise RuntimeError("历史行情回补接口均已触发熔断")
             try:
                 frame = _history_sina(code, fetch_start, effective_end, name=name)
                 with em_lock:
@@ -1118,7 +1118,7 @@ def update_cache(codes, start, end, progress):
                     db._cache_write(pd.concat(batch, ignore_index=True))
                     batch.clear()
                 if progress is not None and (i % 10 == 0 or i == tot_rem):
-                    progress.progress(0.96 + 0.04 * (i / max(1, tot_rem)), text=f"Baostock 兜底 {i}/{tot_rem}")
+                    progress.progress(0.96 + 0.04 * (i / max(1, tot_rem)), text=f"补齐残余标的 {i}/{tot_rem}")
             if batch:
                 db._cache_write(pd.concat(batch, ignore_index=True))
         try:
@@ -1134,11 +1134,11 @@ def update_cache(codes, start, end, progress):
             )
 
     if used_snapshot and backfill_tasks:
-        source = "腾讯批量快照 + 并发历史回补"
+        source = "批量日更 + 历史回补"
     elif used_snapshot:
-        source = "腾讯批量快照"
+        source = "批量增量日更"
     elif backfill_tasks:
-        source = "东方财富/腾讯 HTTPS 并发"
+        source = "并发历史回补"
     else:
         source = "无需更新（已是最新）"
     return {
@@ -1250,7 +1250,7 @@ class AutoSyncManager:
                 "snapshot_updated": stats.get("snapshot_updated", 0),
                 "ex_div": stats.get("ex_div", 0),
                 "effective_end": eff_end,
-                "source": stats.get("source", "腾讯批量快照"),
+                "source": stats.get("source", "批量增量日更"),
                 "status": "warning" if stats.get("failed") else "success",
             }
             # 若已完成当日收盘更新，或已过 15:00 且今天是法定节假日休市，则记录今日已完成避免重复循环
