@@ -591,12 +591,14 @@ def test_intraday_minute_api_and_live_ticker_sync(isolated_db, monkeypatch):
     st, _, _ = _asgi_call(web_server.web_app, "GET", "/api/intraday/bad_code")
     assert st == 400
 
-    # 3. /api/kline 在今日看盘时自动将顶部 ticker 对齐到 14.47（不再停在旧缓存收盘价）
+    # 3. /api/kline 在今日看盘时：即使多年历史接口降级到本地缓存，顶部 ticker 与 K 线最后一根也同步到 14.47
     monkeypatch.setattr(sync, "fetch_kline_history", lambda *a, **k: None)
     st, _, raw = _asgi_call(web_server.web_app, "GET", "/api/kline/sh.600722", f"end={today_iso}")
     assert st == 200
     kl = json.loads(raw)
     assert kl["ticker"]["close"] == 14.47 and kl["ticker"]["date"] == today_iso
+    assert kl["bars"][-1]["time"] == today_iso and kl["bars"][-1]["close"] == 14.47
+    assert kl["bars"][-1]["open"] == 13.0 and kl["bars"][-1]["high"] == 14.47 and kl["bars"][-1]["low"] == 12.88
 
 
 def test_load_market_arrays_resilient_to_dirty_sqlite_and_zero_prices(isolated_db):

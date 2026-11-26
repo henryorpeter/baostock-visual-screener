@@ -343,8 +343,8 @@ def fetch_kline_history(code, interval="日线", end_str=None):
                 "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get",
                 {"param": f"{sym},{period_key},,,{count},qfq"},
                 "https://gu.qq.com/",
-                timeout=4,
-                retries=1,
+                timeout=8,
+                retries=2,
             )
             node = (payload.get("data") or {}).get(sym) or {}
             raw_rows = node.get(f"qfq{period_key}") or node.get(period_key) or []
@@ -368,7 +368,7 @@ def fetch_kline_history(code, interval="日线", end_str=None):
                     _KLINE_EXT_CACHE.popitem(last=False)
         except Exception:
             with _KLINE_EXT_LOCK:
-                _KLINE_EXT_OFFLINE_UNTIL = time.monotonic() + 60.0
+                _KLINE_EXT_OFFLINE_UNTIL = time.monotonic() + 15.0
             return None
 
     out = base_df

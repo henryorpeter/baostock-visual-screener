@@ -436,6 +436,57 @@ async def api_screen_stream(request):
     )
 
 
+def _merge_live_bar_into_kline(frame, quote, interval, already_resampled):
+    """将当日最新实时盘口合成到 K 线 DataFrame 最后一根，避免顶部现价与 K 线收盘价脱节。"""
+    if frame is None or frame.empty or not quote:
+        return frame
+    try:
+        op = float(quote["open"])
+        hi = float(quote["high"])
+        lo = float(quote["low"])
+        cl = float(quote["close"])
+        vol = float(quote.get("volume") or 0.0)
+    except (KeyError, TypeError, ValueError):
+        return frame
+    if not (op > 0 and hi > 0 and lo > 0 and cl > 0):
+        return frame
+    q_ts = pd.Timestamp(quote["date"])
+    d = frame[["date", "open", "high", "low", "close", "volume"]].copy()
+    d["date"] = pd.to_datetime(d["date"])
+    d = d.sort_values("date").reset_index(drop=True)
+    last_idx = len(d) - 1
+    last_ts = pd.Timestamp(d.at[last_idx, "date"])
+    if q_ts < last_ts:
+        return d
+
+    if already_resampled and interval in ("周线", "月线"):
+        freq = "W-FRI" if interval == "周线" else "M"
+        if q_ts.to_period(freq) == last_ts.to_period(freq):
+            d.at[last_idx, "high"] = max(float(d.at[last_idx, "high"]), hi)
+            d.at[last_idx, "low"] = min(float(d.at[last_idx, "low"]), lo)
+            d.at[last_idx, "close"] = cl
+            prev_vol = float(d.at[last_idx, "volume"] or 0.0)
+            if q_ts > last_ts:
+                d.at[last_idx, "date"] = q_ts
+                d.at[last_idx, "volume"] = prev_vol + max(0.0, vol)
+            else:
+                d.at[last_idx, "volume"] = max(prev_vol, vol)
+            return d
+    elif q_ts == last_ts:
+        d.at[last_idx, "open"] = op
+        d.at[last_idx, "high"] = hi
+        d.at[last_idx, "low"] = lo
+        d.at[last_idx, "close"] = cl
+        if vol > 0:
+            d.at[last_idx, "volume"] = vol
+        return d
+
+    new_row = pd.DataFrame(
+        [{"date": q_ts, "open": op, "high": hi, "low": lo, "close": cl, "volume": max(0.0, vol)}]
+    )
+    return pd.concat([d, new_row], ignore_index=True)
+
+
 async def api_kline(request):
     code = request.path_params["code"].strip()
     if not _valid_code(code):
@@ -509,12 +560,11 @@ async def api_kline(request):
         quote_time = ""
 
     # 全套 14 项指标（不按 180 天截断，保留完整多年历史供左拖/缩放与长周期均线/布林带计算）
-    if use_ext:
-        kdf = charts._resample_kline(ext_frame, interval, already_resampled=True)
-        history_source = "extended"
-    else:
-        kdf = charts._resample_kline(local_frame, interval, already_resampled=False)
-        history_source = "local"
+    base_kline = ext_frame if use_ext else local_frame
+    history_source = "extended" if use_ext else "local"
+    if use_live_ticker and live_info is not None:
+        base_kline = _merge_live_bar_into_kline(base_kline, live_info["quote"], interval, already_resampled=use_ext)
+    kdf = charts._resample_kline(base_kline, interval, already_resampled=use_ext)
 
     cols_to_export = [
         "time", "open", "high", "low", "close", "volume",
