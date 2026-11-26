@@ -1,9 +1,10 @@
-baostock>=0.9.4
+starlette>=0.37
+uvicorn>=0.29
 numpy>=1.24
 pandas>=2.0
 requests>=2.31
-starlette>=0.37
-uvicorn>=0.29
-streamlit>=1.30
-streamlit-lightweight-charts-v5>=0.2.0
-streamlit-antd-components>=0.3.2
+baostock>=0.9.4
+# 可选：仅运行旧版 Streamlit 入口（app.py）时才需要
+# streamlit>=1.30
+# streamlit-lightweight-charts-v5>=0.2.0
+# streamlit-antd-components>=0.3.2

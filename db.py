@@ -22,9 +22,13 @@ _STATUS_CACHE = {"ts": 0.0, "data": None}
 
 @contextmanager
 def connect(timeout=30):
-    conn = sqlite3.connect(CACHE_DB, timeout=timeout)
+    db_path = Path(CACHE_DB)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path), timeout=timeout)
     try:
         conn.execute(f"PRAGMA busy_timeout={int(max(1, timeout) * 1000)}")
+        # 强制临时表与排序全走内存，避免 Windows %TEMP% 权限/杀软拦截导致 unable to open database file
+        conn.execute("PRAGMA temp_store=MEMORY")
         with conn:
             yield conn
     finally:
@@ -45,7 +49,10 @@ def _init_cache():
         if _CACHE_INIT_PATH == CACHE_DB and CACHE_DB.exists():
             return
         with connect(timeout=30) as conn:
-            conn.execute("PRAGMA journal_mode=WAL")
+            try:
+                conn.execute("PRAGMA journal_mode=WAL")
+            except sqlite3.OperationalError:
+                pass  # OneDrive/网络盘/FAT32 等不支持 WAL 共享内存时自动回退默认日志模式
             conn.execute("""CREATE TABLE IF NOT EXISTS daily (
                 code TEXT NOT NULL, date TEXT NOT NULL, open REAL, high REAL, low REAL,
                 close REAL, volume REAL, amount REAL, turn REAL, pctChg REAL, isST TEXT,

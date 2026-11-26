@@ -628,6 +628,19 @@ def test_load_market_arrays_resilient_to_dirty_sqlite_and_zero_prices(isolated_d
     )
     assert stats["ready"] == 1
 
+    # 校验 SQLite 临时区强制走内存且全市场查询不产生 TEMP B-TREE（避免 Windows %TEMP% 报错）
+    with db.connect(timeout=30) as conn:
+        assert conn.execute("PRAGMA temp_store").fetchone()[0] == 2
+        plan = " ".join(
+            str(r)
+            for r in conn.execute(
+                "EXPLAIN QUERY PLAN SELECT code,date,open,high,low,close,volume,amount,turn,pctChg "
+                "FROM daily WHERE +date BETWEEN ? AND ? AND close IS NOT NULL ORDER BY code,date",
+                ("2025-01-01", "2027-01-01"),
+            ).fetchall()
+        )
+        assert "TEMP B-TREE" not in plan.upper()
+
 
 # ==================== 6. Legacy AppTest E2E smoke tests ====================
 

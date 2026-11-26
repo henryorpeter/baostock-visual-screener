@@ -4,7 +4,11 @@ import time
 
 import numpy as np
 import pandas as pd
-import streamlit as st
+
+
+def _st():
+    import streamlit as st
+    return st
 
 
 MAIN_OVERLAYS = ("MA", "EMA", "BOLL", "BBI", "SAR", "KC")
@@ -378,7 +382,7 @@ def _style_pct(val):
 
 
 def _inject_custom_css():
-    st.markdown("""
+    _st().markdown("""
 <style>
 :root {
     --bg: #0d0f13;
@@ -889,7 +893,7 @@ def _render_hero(local_status, selected_strategies, auto_sync=None, result=None)
         elif auto_sync["enabled"]:
             parts.append(f'<span>日更 {escape(auto_sync["sync_time"])}</span>')
 
-    st.markdown(
+    _st().markdown(
         f'<div class="term-head">'
         f'<div class="term-brand">KLineRadar<small>A股本地选股与看盘终端</small></div>'
         f'<div class="term-meta">{"".join(parts)}</div>'
@@ -902,7 +906,7 @@ def _render_kpi_cards(local_status, result, scan_count):
     hit_cnt = f"{len(result):,}" if result is not None else "—"
     earliest = local_status["earliest"] or "—"
     newest = local_status["newest"] or "—"
-    st.markdown(
+    _st().markdown(
         f'<div class="flat-grid">'
         f'<div class="flat-cell"><div class="flat-k">本地股票数</div><div class="flat-v">{local_status["stocks"]:,}</div><div class="flat-sub">股票池 {local_status["named"]:,} 只</div></div>'
         f'<div class="flat-cell"><div class="flat-k">日线记录</div><div class="flat-v">{local_status["rows"]:,}</div><div class="flat-sub">{local_status["size_mb"]:.1f} MB</div></div>'
@@ -920,7 +924,7 @@ class FloatingProgress:
         self.title = title
         self.steps = steps
         self.started = time.monotonic()
-        self.slot = st.empty()
+        self.slot = _st().empty()
 
     def update(self, ratio, stage=1, detail="", hits=None, scanned=None, total=None):
         pct = int(round(min(1.0, max(0.0, ratio)) * 100))

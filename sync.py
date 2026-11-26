@@ -10,10 +10,12 @@ import time
 import requests
 from requests.adapters import HTTPAdapter
 
-import baostock as bs
+try:
+    import baostock as bs
+except ImportError:
+    bs = None
 import numpy as np
 import pandas as pd
-import streamlit as st
 
 import db
 
@@ -56,6 +58,9 @@ def _baostock_reachable(timeout=3.0):
 
 def _query(fn):
     global BAOSTOCK_AVAILABLE
+    if bs is None:
+        BAOSTOCK_AVAILABLE = False
+        raise RuntimeError("历史补全依赖未安装，已自动使用在线行情接口。")
     if not _baostock_reachable(timeout=3.0):
         BAOSTOCK_AVAILABLE = False
         raise RuntimeError(
@@ -238,9 +243,22 @@ def _fetch_stock_list(day):
     return frame, actual_day, source
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+_STOCK_LIST_CACHE = {}
+_STOCK_LIST_LOCK = threading.Lock()
+
+
 def stock_list(day):
-    return _fetch_stock_list(day)
+    now = time.monotonic()
+    with _STOCK_LIST_LOCK:
+        hit = _STOCK_LIST_CACHE.get(day)
+        if hit and now - hit[0] < 3600:
+            return hit[1]
+    res = _fetch_stock_list(day)
+    with _STOCK_LIST_LOCK:
+        if len(_STOCK_LIST_CACHE) > 8:
+            _STOCK_LIST_CACHE.clear()
+        _STOCK_LIST_CACHE[day] = (now, res)
+    return res
 
 
 def _history(code, start, end):
@@ -1306,7 +1324,6 @@ def get_sync_manager_singleton():
     return _SINGLETON_MGR
 
 
-@st.cache_resource
 def get_auto_sync_manager():
     return get_sync_manager_singleton()
 
