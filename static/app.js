@@ -54,6 +54,7 @@
     chartResizeObs: null,
     paneSubMap: [],
     klineReqSeq: 0,
+    klineUseScanRange: false,
 
     // Sync polling
     syncTimer: null,
@@ -77,6 +78,13 @@
     return Math.round(v).toString();
   };
   const pctClass = (v) => (v === null || v === undefined ? "" : Number(v) >= 0 ? "up" : "down");
+
+  function fmtLocalDate(dt) {
+    const y = dt.getFullYear();
+    const m = String(dt.getMonth() + 1).padStart(2, "0");
+    const d = String(dt.getDate()).padStart(2, "0");
+    return `${y}-${m}-${d}`;
+  }
 
   function escHtml(str) {
     return String(str ?? "")
@@ -237,8 +245,16 @@
       el.classList.toggle("active", el.id === `view-${view}`);
     });
     if (view === "cache") refreshSyncStatus();
-    if (view === "terminal" && state.chart && state.klineData) {
-      requestAnimationFrame(() => resizeChart());
+    if (view === "terminal" && state.chart) {
+      requestAnimationFrame(() => {
+        if (state.interval === "分时" && state.intradayCtx) {
+          const scrollWrap = $("chartScrollWrap");
+          $("chartMount").style.height = Math.max(280, scrollWrap.clientHeight) + "px";
+          state.intradayCtx.fit?.();
+        } else if (state.klineData) {
+          resizeChart();
+        }
+      });
     }
   }
 
@@ -334,14 +350,14 @@
       $("toggleExcludeGem").classList.toggle("active", state.excludeGem);
     });
 
-    // Date range presets
+    // Date range presets（按本地日历计算，避免 UTC+8 偏移 1 天及隔夜停留在昨天）
     document.querySelectorAll(".preset-btn").forEach((btn) => {
       btn.addEventListener("click", () => {
         const days = Number(btn.dataset.days);
-        const endStr = state.bootstrap?.today || new Date().toISOString().slice(0, 10);
-        const dt = new Date(endStr + "T00:00:00");
-        dt.setDate(dt.getDate() - days);
-        const startStr = dt.toISOString().slice(0, 10);
+        const endDt = new Date();
+        const endStr = fmtLocalDate(endDt);
+        const startDt = new Date(endDt.getFullYear(), endDt.getMonth(), endDt.getDate() - days);
+        const startStr = fmtLocalDate(startDt);
         state.startDate = startStr;
         state.endDate = endStr;
         $("inputStartDate").value = startStr;
@@ -433,7 +449,15 @@
       const body = $("fwdBody");
       const hidden = body.classList.toggle("hidden");
       $("fwdToggleCaret").textContent = hidden ? "▸" : "▾";
-      requestAnimationFrame(() => resizeChart());
+      requestAnimationFrame(() => {
+        if (state.interval === "分时" && state.intradayCtx) {
+          const scrollWrap = $("chartScrollWrap");
+          $("chartMount").style.height = Math.max(280, scrollWrap.clientHeight) + "px";
+          state.intradayCtx.fit?.();
+        } else {
+          resizeChart();
+        }
+      });
     });
 
     // Right Dock tabs & filters
@@ -716,7 +740,7 @@
             closeAllPopovers();
             $("globalSearchInput").value = "";
             switchView("terminal");
-            openStock(btn.dataset.code, btn.dataset.name);
+            openStock(btn.dataset.code, btn.dataset.name, { useScanRange: false });
           });
         });
       }
@@ -764,11 +788,12 @@
     }, 100);
 
     try {
+      const minChangeRaw = $("inputMinChange").value.trim();
       const payload = {
         strategies,
         start: state.startDate,
         end: state.endDate,
-        min_change: Number($("inputMinChange").value) || 0,
+        min_change: minChangeRaw === "" ? null : Number(minChangeRaw),
         min_amount: Number($("inputMinAmount").value) || 0,
         max_turn: Number($("inputMaxTurn").value) || 100,
         max_stocks: Number($("inputMaxStocks").value) || 6000,
@@ -849,7 +874,7 @@
 
       if (state.visibleRows.length > 0) {
         const first = state.visibleRows[0];
-        await openStock(first.code, first.name);
+        await openStock(first.code, first.name, { useScanRange: true });
         showToast(`扫描完成：命中 ${state.aggregated.length} 只股票 (${state.scanStats.elapsed}s)`);
       } else {
         showToast(`本次扫描未命中信号，可适当放宽过滤条件或切换策略`);
@@ -1037,7 +1062,7 @@
       }
       const row = e.target.closest(".stock-row");
       if (row) {
-        openStock(row.dataset.code, row.dataset.name);
+        openStock(row.dataset.code, row.dataset.name, { useScanRange: state.dockTab === "signals" });
       }
     };
   }
@@ -1049,7 +1074,7 @@
     if (nextIdx < 0) nextIdx = state.visibleRows.length - 1;
     if (nextIdx >= state.visibleRows.length) nextIdx = 0;
     const target = state.visibleRows[nextIdx];
-    openStock(target.code, target.name);
+    openStock(target.code, target.name, { useScanRange: state.dockTab === "signals" });
     const rowEl = $("dockList").querySelector(`.stock-row[data-idx="${nextIdx}"]`);
     if (rowEl) rowEl.scrollIntoView({ block: "nearest" });
   }
@@ -1079,7 +1104,7 @@
       )
       .join("");
     host.querySelectorAll(".quick-pill").forEach((btn) => {
-      btn.addEventListener("click", () => openStock(btn.dataset.openCode, btn.dataset.openName));
+      btn.addEventListener("click", () => openStock(btn.dataset.openCode, btn.dataset.openName, { useScanRange: false }));
     });
   }
 
@@ -1185,9 +1210,10 @@
     }, 5000);
   }
 
-  async function openStock(code, name) {
+  async function openStock(code, name, opts = {}) {
     state.currentCode = code;
     state.currentName = name || code;
+    state.klineUseScanRange = Boolean(opts.useScanRange);
     $("emptyStage").classList.add("hidden");
     $("chartStage").classList.remove("hidden");
     syncToolbarModeUI();
@@ -1511,6 +1537,7 @@
       state.chart.timeScale().fitContent();
       requestAnimationFrame(() => positionSubpaneLegends(state.paneSubMap));
     };
+    ctx.fit = fitStandardDay;
     fitStandardDay();
 
     $("subpaneLegends").innerHTML = `<div class="pane-legend-badge" data-pane="1"><span class="pane-legend-vals"></span></div>`;
@@ -1546,8 +1573,8 @@
     const seq = ++state.klineReqSeq;
     $("chartLoading").classList.remove("hidden");
 
-    const start = state.scanRange?.start || state.startDate;
-    const end = state.scanRange?.end || state.endDate;
+    const start = state.klineUseScanRange ? (state.scanRange?.start || state.startDate) : state.startDate;
+    const end = state.klineUseScanRange ? (state.scanRange?.end || state.endDate) : fmtLocalDate(new Date());
     const qs = new URLSearchParams({ interval: state.interval, start, end });
 
     try {
@@ -1947,7 +1974,7 @@
   }
 
   function resizeChart() {
-    if (!state.chart) return;
+    if (!state.chart || state.interval === "分时") return;
     const scrollWrap = $("chartScrollWrap");
     const mount = $("chartMount");
     const activeSubs = (state.bootstrap?.sub_indicators || []).filter((k) => state.subs.has(k));
@@ -2103,6 +2130,18 @@
       return;
     }
 
+    const codeSet = new Set(codes);
+    let exportRows;
+    if (state.dockTab === "watchlist") {
+      exportRows = sourceRows;
+    } else if (state.signals.length) {
+      exportRows = state.signals.filter(
+        (r) => codeSet.has(r.code) && (!state.dockStrategy || r.strategy === state.dockStrategy)
+      );
+    } else {
+      exportRows = sourceRows;
+    }
+
     try {
       const res = await fetch("/api/export", {
         method: "POST",
@@ -2110,7 +2149,7 @@
         body: JSON.stringify({
           format: fmt,
           codes,
-          signals: state.signals.length ? state.signals : sourceRows,
+          signals: exportRows,
         }),
       });
       if (!res.ok) throw new Error("导出失败");

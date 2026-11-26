@@ -21,9 +21,26 @@ import db
 
 
 BAOSTOCK_AVAILABLE = None
+_BAOSTOCK_RETRY_AFTER = 0.0
+_BAOSTOCK_COOLDOWN = 600.0
 SYNC_LOCK = threading.Lock()
 _BAOSTOCK_LOCK = threading.Lock()
 _THREAD_LOCAL = threading.local()
+
+
+def _baostock_allowed():
+    """允许探活兜底源；偶发故障 10 分钟后自动恢复重试，测试手动置 False 时保持禁用。"""
+    if bs is None:
+        return False
+    if BAOSTOCK_AVAILABLE is not False:
+        return True
+    return _BAOSTOCK_RETRY_AFTER > 0.0 and time.monotonic() >= _BAOSTOCK_RETRY_AFTER
+
+
+def _mark_baostock_down():
+    global BAOSTOCK_AVAILABLE, _BAOSTOCK_RETRY_AFTER
+    BAOSTOCK_AVAILABLE = False
+    _BAOSTOCK_RETRY_AFTER = time.monotonic() + _BAOSTOCK_COOLDOWN
 
 
 def _http_session():
@@ -57,14 +74,14 @@ def _baostock_reachable(timeout=3.0):
 
 
 def _query(fn):
-    global BAOSTOCK_AVAILABLE
+    global BAOSTOCK_AVAILABLE, _BAOSTOCK_RETRY_AFTER
     if bs is None:
-        BAOSTOCK_AVAILABLE = False
+        _mark_baostock_down()
         raise RuntimeError("历史补全依赖未安装，已自动使用在线行情接口。")
     if not _baostock_reachable(timeout=3.0):
-        BAOSTOCK_AVAILABLE = False
+        _mark_baostock_down()
         raise RuntimeError(
-            "Baostock 服务不可达（public-api.baostock.com:10030 连接超时），已自动跳过。"
+            "历史备用通道连接超时，已自动跳过。"
         )
     last = None
     with _BAOSTOCK_LOCK:
@@ -79,6 +96,7 @@ def _query(fn):
                     login = None
                 if login is not None and login.error_code == "0":
                     BAOSTOCK_AVAILABLE = True
+                    _BAOSTOCK_RETRY_AFTER = 0.0
                     try:
                         return fn()
                     finally:
@@ -212,7 +230,7 @@ def _fetch_stock_list(day):
     except Exception as qq_error:
         errors.append(f"列表接口失败：{qq_error}")
 
-    if frame.empty and BAOSTOCK_AVAILABLE is not False:
+    if frame.empty and _baostock_allowed():
         def run():
             requested = pd.Timestamp(day)
             for offset in range(11):
@@ -225,7 +243,7 @@ def _fetch_stock_list(day):
             frame, actual_day = _query(run)
             source = "备用行情列表"
         except Exception as bs_error:
-            BAOSTOCK_AVAILABLE = False
+            _mark_baostock_down()
             errors.append(f"备用列表失败：{bs_error}")
 
     if frame.empty:
@@ -241,24 +259,6 @@ def _fetch_stock_list(day):
         return frame, actual_day, source
     frame = frame[frame.code.str.match(r"^(sh\.(600|601|603|605|688|689)|sz\.(000|001|002|003|300|301))\d{3}$")].copy()
     return frame, actual_day, source
-
-
-_STOCK_LIST_CACHE = {}
-_STOCK_LIST_LOCK = threading.Lock()
-
-
-def stock_list(day):
-    now = time.monotonic()
-    with _STOCK_LIST_LOCK:
-        hit = _STOCK_LIST_CACHE.get(day)
-        if hit and now - hit[0] < 3600:
-            return hit[1]
-    res = _fetch_stock_list(day)
-    with _STOCK_LIST_LOCK:
-        if len(_STOCK_LIST_CACHE) > 8:
-            _STOCK_LIST_CACHE.clear()
-        _STOCK_LIST_CACHE[day] = (now, res)
-    return res
 
 
 def _history(code, start, end):
@@ -284,7 +284,8 @@ def _history_http(code, start, end, name=""):
         "https://gu.qq.com/",
     )
     payload = (payload.get("data") or {}).get(f"{market}{symbol}", {})
-    rows = [row[:6] for row in payload.get("qfqday", []) if len(row) >= 6]
+    raw_rows = payload.get("qfqday") or payload.get("day") or []
+    rows = [row[:6] for row in raw_rows if len(row) >= 6]
     frame = pd.DataFrame(rows, columns=["date", "open", "close", "high", "low", "volume"])
     if frame.empty:
         raise RuntimeError(f"腾讯 HTTPS 备用源未返回 {code} 的日线数据")
@@ -744,7 +745,7 @@ def _recent_trade_days(end_str, now=None):
             pass
         days = sorted(local_days)
 
-    if not days and BAOSTOCK_AVAILABLE is not False:
+    if not days and _baostock_allowed():
         try:
             start_probe = (pd.Timestamp(end_str) - pd.Timedelta(days=45)).strftime("%Y-%m-%d")
             def run_idx():
@@ -1115,9 +1116,9 @@ def update_cache(codes, start, end, progress):
         else:
             skipped += len(dedup_patch)
 
-    # 4. 仅针对 HTTPS 均失败的个别残余标的启用 Baostock 兜底（先 3 秒探活避免卡死）
+    # 4. 仅针对 HTTPS 均失败的个别残余标的启用历史兜底通道（先 3 秒探活避免卡死）
     remaining = [(code, fetch_start) for code, _, fetch_start in backfill_tasks if code not in successful]
-    if remaining and BAOSTOCK_AVAILABLE is not False:
+    if remaining and _baostock_allowed():
         def fetch_baostock():
             batch = []
             tot_rem = len(remaining)
@@ -1142,12 +1143,15 @@ def update_cache(codes, start, end, progress):
         try:
             _query(fetch_baostock)
         except Exception:
-            BAOSTOCK_AVAILABLE = False
+            _mark_baostock_down()
 
     if successful and effective_end >= start:
         with db.connect(timeout=30) as conn:
             conn.executemany(
-                "INSERT OR REPLACE INTO sync_meta(code,start_date,through_date) VALUES (?,?,?)",
+                "INSERT INTO sync_meta(code,start_date,through_date) VALUES (?,?,?) "
+                "ON CONFLICT(code) DO UPDATE SET "
+                "start_date=MIN(sync_meta.start_date, excluded.start_date), "
+                "through_date=MAX(sync_meta.through_date, excluded.through_date)",
                 ((code, start, effective_end) for code in successful),
             )
 
@@ -1271,9 +1275,17 @@ class AutoSyncManager:
                 "source": stats.get("source", "批量增量日更"),
                 "status": "warning" if stats.get("failed") else "success",
             }
-            # 若已完成当日收盘更新，或已过 15:00 且今天是法定节假日休市，则记录今日已完成避免重复循环
-            if eff_end >= today_str or datetime.now().strftime("%H:%M") >= "15:00":
+            # 仅在全部成功且已同步今日（或 15:30 后在线探活确认今天休市）时才标记今日完成；否则 15 分钟后自动补跑
+            has_fail = bool(stats.get("failed"))
+            now_hm = datetime.now().strftime("%H:%M")
+            confirmed_holiday = False
+            if not has_fail and eff_end < today_str and now_hm >= "15:30":
+                snap_d = _probe_snapshot_date()
+                confirmed_holiday = bool(snap_d and snap_d < today_str)
+            if not has_fail and (eff_end >= today_str or confirmed_holiday):
                 db._setting_set("auto_sync_last_date", today_str)
+            else:
+                self._set_state(retry_after=time.monotonic() + 900)
             db._setting_set("auto_sync_last_info", json.dumps(info, ensure_ascii=False))
             self._set_state(ratio=1.0, text=f"{trigger_label}完成：更新 {info['updated']} 只，跳过 {info['skipped']} 只")
         except Exception as exc:
@@ -1322,9 +1334,5 @@ def get_sync_manager_singleton():
                 mgr.start()
                 _SINGLETON_MGR = mgr
     return _SINGLETON_MGR
-
-
-def get_auto_sync_manager():
-    return get_sync_manager_singleton()
 
 

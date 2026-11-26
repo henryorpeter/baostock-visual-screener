@@ -129,6 +129,11 @@ def _cache_write(frame):
             "INSERT OR REPLACE INTO daily (date,code,open,high,low,close,volume,amount,turn,pctChg,isST) "
             "VALUES (?,?,?,?,?,?,?,?,?,?,?)", data.itertuples(index=False, name=None),
         )
+        # 每次写库递增版本号，确保除权回补等同行数覆写也能即时失效内存选股缓存
+        conn.execute(
+            "INSERT OR REPLACE INTO app_settings(key, value) VALUES ('cache_rev', ?)",
+            (str(time.time_ns()),),
+        )
     _invalidate_status_cache()
 
 

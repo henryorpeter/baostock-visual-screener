@@ -71,7 +71,6 @@ baostock-visual-screener/
 ├── sync.py                  # 收盘自动调度器与增量行情同步模块
 ├── db.py                    # SQLite 本地缓存、股票池、配置与自选观察池管理
 ├── charts.py                # 全套 14 项 K 线周期重采样与技术指标计算
-├── app.py / baostock_screener.py  # 旧版 Streamlit 兼容入口（保留备份）
 ├── tests/
 │   └── test_core.py         # pytest 核心模块与 Web API 回归测试套件
 ├── assets/                  # README 演示动图与赞赏码素材
@@ -209,7 +208,7 @@ python web_server.py --port 8506
    location / {
        proxy_pass http://127.0.0.1:8506;
        proxy_http_version 1.1;
-       proxy_set_header Host $host;
+       proxy_set_header Host $http_host;
        proxy_buffering off;
        proxy_read_timeout 300;
    }

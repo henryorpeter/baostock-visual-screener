@@ -156,10 +156,6 @@ def _load_market_arrays_raw(start, end):
     return market
 
 
-def _load_market_arrays_cached(start, end, db_rows, db_newest, db_rev="0"):
-    return load_market_arrays(start, end, db_rows, db_newest, db_rev)
-
-
 def _limit_pct_threshold(code):
     """按板块返回涨跌停幅度阈值：双创 20cm(19.5%)、北交所 30cm(29.5%)、主板 10cm(9.5%)。"""
     if code.startswith(("sh.688", "sh.689", "sz.300", "sz.301")):
@@ -434,13 +430,6 @@ def screen(
     rows = []
     sparks = {}
     stats = {"ready": 0, "missing": 0, "short": 0, "filtered": 0}
-    fallback_progress = None
-    if not on_progress:
-        try:
-            import streamlit as st
-            fallback_progress = st.progress(0, text="正在读取本地行情…")
-        except Exception:
-            fallback_progress = None
     window_start_str = pd.Timestamp(window_start).strftime("%Y-%m-%d") if window_start is not None else None
     non_rps = [s for s in strategies if s != "RPS强势突破"]
     need_rps = "RPS强势突破" in strategies
@@ -449,8 +438,6 @@ def screen(
     def _emit(ratio, stage, detail, hits=0, scanned=0, total=0):
         if on_progress:
             on_progress(ratio, stage=stage, detail=detail, hits=hits, scanned=scanned, total=total)
-        elif fallback_progress is not None:
-            fallback_progress.progress(min(1.0, max(0.0, ratio)), text=detail)
 
     def _record_spark(code, close_arr):
         if code not in sparks:
@@ -584,8 +571,6 @@ def screen(
         return pd.DataFrame(rows).sort_values("涨跌幅%", ascending=False).reset_index(drop=True) if rows else pd.DataFrame()
 
     result = run()
-    if fallback_progress is not None:
-        fallback_progress.empty()
     stats["sparks"] = sparks
     return result, stats
 
@@ -610,7 +595,12 @@ def compute_forward_returns(result_df, signal_end_str):
 
     future_closes = {}
     for code, _dt, cl in rows:
-        future_closes.setdefault(code, []).append(float(cl))
+        try:
+            val = float(cl)
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(val):
+            future_closes.setdefault(code, []).append(val)
 
     # 以信号当日收盘价为基准计算 T+5 / T+10 涨跌幅
     base_close = dict(result_df[["代码", "收盘"]].drop_duplicates("代码").itertuples(index=False, name=None))

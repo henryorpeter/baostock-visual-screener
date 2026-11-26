@@ -166,6 +166,7 @@ def _watchlist_with_quotes():
     out = []
     for code, name, added_at in rows:
         dt_s, cl, pct, trn, amt = latest_map.get(code, (None, None, None, None, None))
+        amt_num = _clean_num(amt)
         out.append({
             "code": code,
             "name": name,
@@ -173,7 +174,7 @@ def _watchlist_with_quotes():
             "close": _clean_num(cl, 2),
             "pctChg": _clean_num(pct, 2),
             "turn": _clean_num(trn, 2),
-            "amount_yi": _clean_num(float(amt) / 1e8, 2) if amt is not None else None,
+            "amount_yi": round(amt_num / 1e8, 2) if amt_num is not None else None,
             "added_at": added_at,
         })
     return out
@@ -248,7 +249,8 @@ def _run_screen_core(body, emit=None):
     if not strategies:
         return None, ("请至少选择 1 套选股策略", 400)
 
-    min_change, err_msg = _parse_finite_float(body.get("min_change"), 0.0, -35.0, 35.0, "min_change")
+    # 留空时不限最低涨幅，确保「上升趋势跌停反包」与「涨停洗盘策略」等可正常命中
+    min_change, err_msg = _parse_finite_float(body.get("min_change"), -35.0, -35.0, 35.0, "min_change")
     if err_msg:
         return None, (err_msg, 400)
     max_turn, err_msg = _parse_finite_float(body.get("max_turn"), 100.0, 0.0, 100.0, "max_turn")
@@ -495,15 +497,23 @@ async def api_kline(request):
     if interval not in ("日线", "周线", "月线"):
         interval = "日线"
     today_dt = date.today()
-    end_str = (request.query_params.get("end") or today_dt.strftime("%Y-%m-%d")).strip()[:10]
+    today_str = today_dt.strftime("%Y-%m-%d")
+    end_str = (request.query_params.get("end") or today_str).strip()[:10]
     if not _valid_date_str(end_str):
         return JSONResponse({"error": "截止日期格式无效，请使用 YYYY-MM-DD"}, status_code=400)
 
-    # 1. 本地日线（用于顶部精准换手率/成交额卡片，以及离线兜底）
+    # 1. 本地日线（用于换手率/成交额卡片及离线兜底）
     local_frame = db._cache_read(code, "1990-01-01", end_str)
 
-    # 2. 按需拉取单股多年期前复权日线/周线/月线（4年日线 / 10年周线 / 20年月线），失败自动回退本地库
-    ext_frame = await asyncio.to_thread(sync.fetch_kline_history, code, interval, end_str)
+    # 2. 并发拉取多年期前复权 K 线与当日盘中实时行情（消除串行等待，弱网/离线响应快一倍）
+    ext_task = asyncio.to_thread(sync.fetch_kline_history, code, interval, end_str)
+    if end_str >= today_str:
+        ext_frame, live_info = await asyncio.gather(
+            ext_task,
+            asyncio.to_thread(sync.fetch_intraday_minute, code),
+        )
+    else:
+        ext_frame, live_info = await ext_task, None
 
     use_ext = False
     if ext_frame is not None and not ext_frame.empty:
@@ -519,13 +529,8 @@ async def api_kline(request):
     name_map = dict(_get_universe_cached())
     name = name_map.get(code, code)
 
-    # 最新日行情卡片摘要：若非历史回测且在线存在更新的盘中/最新实时行情，顶部行情栏自动对齐到最新实时价（避免上面昨收下面盘中打架）
-    today_str = today_dt.strftime("%Y-%m-%d")
-    live_info = None
-    if end_str >= today_str:
-        live_info = await asyncio.to_thread(sync.fetch_intraday_minute, code)
-
     local_last_date = pd.Timestamp(local_frame.iloc[-1].date).strftime("%Y-%m-%d") if not local_frame.empty else ""
+    ext_last_date = pd.Timestamp(ext_frame.iloc[-1].date).strftime("%Y-%m-%d") if (use_ext and ext_frame is not None and not ext_frame.empty) else ""
     use_live_ticker = (
         live_info is not None
         and live_info.get("quote") is not None
@@ -544,7 +549,9 @@ async def api_kline(request):
         if live_info.get("name") and name == code:
             name = live_info["name"]
     else:
-        ticker_src = local_frame if not local_frame.empty else ext_frame
+        # 若分时接口超时但多年历史接口拿到了比本地库更新的交易日，顶部行情条同步采用 ext_frame 避免上下价格打架
+        use_ext_ticker = use_ext and (local_frame.empty or ext_last_date > local_last_date)
+        ticker_src = ext_frame if use_ext_ticker else local_frame
         latest = ticker_src.iloc[-1]
         prior = ticker_src.iloc[-2].close if len(ticker_src) > 1 else latest.close
         ticker_date = pd.Timestamp(latest.date).strftime("%Y-%m-%d")
@@ -856,7 +863,17 @@ web_app = Starlette(
 )
 
 
+def _ensure_utf8_stdio():
+    for stream in (sys.stdout, sys.stderr):
+        if stream is not None and hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+
+
 def run_server(host="0.0.0.0", port=8506, open_browser=False):
+    _ensure_utf8_stdio()
     db._init_cache()
     sync.get_sync_manager_singleton()
     if open_browser:
@@ -865,6 +882,7 @@ def run_server(host="0.0.0.0", port=8506, open_browser=False):
 
 
 if __name__ == "__main__":
+    _ensure_utf8_stdio()
     parser = argparse.ArgumentParser(description="KLineRadar Native Web Server")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8506)

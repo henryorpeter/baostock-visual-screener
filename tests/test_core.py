@@ -93,8 +93,14 @@ def test_db_cache_read_write_status_and_watchlist(isolated_db):
     st2 = db.cache_status()
     assert st2 == st1
 
-    rows, newest, rev = db._cache_version()
-    assert rows == 30 and newest != "" and rev == "0"
+    rows, newest, rev1 = db._cache_version()
+    assert rows == 30 and newest != "" and rev1 != "0"
+    # 覆写同区间数据（模拟除权前复权回补，行数与最新日期不变）必须刷新 cache_rev 使内存选股缓存失效
+    df_adj = df.copy()
+    df_adj["close"] = df_adj["close"] * 0.5
+    db._cache_write(df_adj)
+    rows2, newest2, rev2 = db._cache_version()
+    assert rows2 == rows and newest2 == newest and rev2 != rev1
 
     # Watchlist CRUD
     db.watchlist_add("sh.600519", "贵州茅台")
@@ -206,23 +212,16 @@ def test_compute_forward_returns_with_resonance(isolated_db):
 
 # ==================== 3. charts.py tests ====================
 
-def test_charts_resample_panes_and_formatters():
+def test_charts_resample_indicators_and_formatters():
     df = _make_ohlcv(n=120, seed=5)
     for iv in ("日线", "周线", "月线"):
-        panes, kdf = charts.chart_panes(df, "测试 · sh.600000", iv, show_ma=True, show_macd=True)
-        assert len(panes) == 3 and not kdf.empty
+        kdf = charts._resample_kline(df, iv)
+        assert not kdf.empty and "time" in kdf.columns
 
-    # 全套 6 主图(MA/EMA/BOLL/BBI/SAR/KC) + 8 副图(VOL/MACD/KDJ/RSI/WR/CCI/OBV/ATR) 叠加验证
-    full_panes, kdf_all = charts.chart_panes(
-        df, "测试 · sh.600000", "日线",
-        overlays=list(charts.MAIN_OVERLAYS),
-        sub_panes=list(charts.SUB_INDICATORS),
-    )
-    assert len(full_panes) == 9
-    # 主图包含：1 蜡烛 + 4 MA + 3 EMA + 3 BOLL + 1 BBI + 1 SAR + 3 KC = 16 条序列
-    assert len(full_panes[0]["series"]) == 16
+    kdf_all = charts._resample_kline(df, "日线")
     for col in (
-        "ema12", "ema60", "boll_up", "boll_dn", "bbi", "sar", "kc_up", "kc_dn",
+        "ma5", "ma20", "ema12", "ema60", "boll_up", "boll_dn", "bbi", "sar", "kc_up", "kc_dn",
+        "vol_ma5", "dif", "dea", "macd_hist",
         "kdj_k", "kdj_d", "kdj_j", "rsi6", "rsi12", "rsi24",
         "wr10", "wr6", "cci", "obv", "obv_ma30", "atr14",
     ):
@@ -231,8 +230,6 @@ def test_charts_resample_panes_and_formatters():
     assert charts._fmt_amount(2.5e8) == "2.50 亿"
     assert charts._fmt_amount(3.2e4) == "3 万"
     assert charts._fmt_volume(1.5e6) == "1.50 M"
-    assert "fecaca" in charts._style_pct(10.0)
-    assert "0ecb81" in charts._style_pct(-2.5)
 
 
 # ==================== 4. sync.py unit tests ====================
@@ -644,12 +641,107 @@ def test_load_market_arrays_resilient_to_dirty_sqlite_and_zero_prices(isolated_d
         assert "TEMP B-TREE" not in plan.upper()
 
 
-# ==================== 6. Legacy AppTest E2E smoke tests ====================
+# ==================== 6. Audit fix regression tests ====================
 
-@pytest.mark.parametrize("entry_file", ["app.py", "baostock_screener.py"])
-def test_streamlit_entrypoints_boot_without_exceptions(entry_file):
-    from streamlit.testing.v1 import AppTest
+def test_limit_down_strategy_works_with_default_min_change_and_dirty_watchlist(isolated_db, monkeypatch):
+    import json
+    import web_server
 
-    at = AppTest.from_file(str(ROOT / entry_file), default_timeout=25)
-    at.run()
-    assert not at.exception, f"{entry_file} raised: {[str(e.value) for e in at.exception]}"
+    # 1. 构造多头趋势中放量跌停标的，验证默认未填 min_change 时「上升趋势跌停反包」能正常命中
+    df = _make_ohlcv(n=100, seed=31, trend=0.008, code="sh.600888")
+    df["close"] = np.linspace(10.0, 20.0, 100)
+    df["open"] = df["close"] * 0.995
+    df["high"] = df["close"] * 1.01
+    df["low"] = df["close"] * 0.99
+    df["volume"] = 2e6
+    df["pctChg"] = pd.Series(df["close"]).pct_change().mul(100.0).fillna(0.0)
+    prev_c = float(df["close"].iloc[-2])
+    df.iloc[-1, df.columns.get_loc("open")] = prev_c * 0.96
+    df.iloc[-1, df.columns.get_loc("close")] = prev_c * 0.90  # 跌停 -10%
+    df.iloc[-1, df.columns.get_loc("high")] = prev_c * 0.97
+    df.iloc[-1, df.columns.get_loc("low")] = prev_c * 0.90
+    df.iloc[-1, df.columns.get_loc("volume")] = 6e6  # 放量 3 倍
+    df.iloc[-1, df.columns.get_loc("pctChg")] = -10.0
+    db._cache_write(df)
+    db.cache_universe_save(pd.DataFrame([{"code": "sh.600888", "code_name": "测试反包股"}]))
+    web_server._get_universe_cached(force=True)
+    engine._ARRAY_CACHE.clear()
+
+    first_day = df["date"].iloc[0].strftime("%Y-%m-%d")
+    last_day = df["date"].iloc[-1].strftime("%Y-%m-%d")
+    st, _, raw = _asgi_call(
+        web_server.web_app,
+        "POST",
+        "/api/screen",
+        json_body={
+            "strategies": ["上升趋势跌停反包"],
+            "start": first_day,
+            "end": last_day,
+            "min_change": None,
+        },
+    )
+    assert st == 200
+    scr = json.loads(raw)
+    assert len(scr["signals"]) == 1 and scr["signals"][0]["code"] == "sh.600888"
+
+    # 2. 自选池对应日线含脏空字符串 amount='' 时，/api/bootstrap 与 /api/watchlist 不应 500 崩溃
+    db.watchlist_add("sh.600888", "测试反包股")
+    with db.connect(timeout=30) as conn:
+        conn.execute("UPDATE daily SET amount = '' WHERE code = 'sh.600888' AND date = ?", (last_day,))
+    st, _, raw = _asgi_call(web_server.web_app, "GET", "/api/watchlist")
+    assert st == 200
+    wl = json.loads(raw)["items"]
+    assert len(wl) == 1 and wl[0]["amount_yi"] is None
+
+    # 3. 当分时接口超时但 ext_frame 比本地库新时，顶部 ticker 必须与 ext_frame 对齐
+    monkeypatch.setattr(sync, "fetch_intraday_minute", lambda *a, **k: None)
+    ext_df = df[["date", "open", "high", "low", "close", "volume"]].copy()
+    next_row = pd.DataFrame([{
+        "date": df["date"].iloc[-1] + pd.Timedelta(days=1),
+        "open": 18.2, "high": 19.5, "low": 18.0, "close": 19.2, "volume": 5e6,
+    }])
+    ext_df = pd.concat([ext_df, next_row], ignore_index=True)
+    monkeypatch.setattr(sync, "fetch_kline_history", lambda *a, **k: ext_df)
+    st, _, raw = _asgi_call(web_server.web_app, "GET", "/api/kline/sh.600888", "end=2099-12-31")
+    assert st == 200
+    kl = json.loads(raw)
+    assert kl["ticker"]["close"] == 19.2 and kl["bars"][-1]["close"] == 19.2
+
+
+def test_sync_history_http_day_key_and_autosync_failure_guard(isolated_db, monkeypatch):
+    # 1. 未除权次新股仅返回 "day"（无 "qfqday"）时 _history_http 仍应正常解析
+    monkeypatch.setattr(
+        sync,
+        "_https_json",
+        lambda url, params, referer, timeout=12, retries=3: {
+            "data": {"sh601091": {"day": [
+                ["2026-11-24", "10.00", "10.50", "10.60", "9.90", "1200"],
+                ["2026-11-25", "10.50", "11.00", "11.20", "10.40", "1500"],
+            ]}}
+        },
+    )
+    frame = sync._history_http("sh.601091", "2026-11-01", "2026-11-26", name="次新测试")
+    assert len(frame) == 2 and float(frame.iloc[-1]["close"]) == 11.0
+
+    # 2. sync_meta ON CONFLICT DO UPDATE 必须保留更早的 start_date 和更晚的 through_date
+    with db.connect(timeout=30) as conn:
+        conn.execute("INSERT INTO sync_meta(code,start_date,through_date) VALUES ('sh.601091','2025-11-01','2026-11-20')")
+        conn.execute(
+            "INSERT INTO sync_meta(code,start_date,through_date) VALUES ('sh.601091','2026-04-01','2026-11-25') "
+            "ON CONFLICT(code) DO UPDATE SET "
+            "start_date=MIN(sync_meta.start_date, excluded.start_date), "
+            "through_date=MAX(sync_meta.through_date, excluded.through_date)"
+        )
+        row = conn.execute("SELECT start_date, through_date FROM sync_meta WHERE code='sh.601091'").fetchone()
+    assert row == ("2025-11-01", "2026-11-25")
+
+    # 3. 自动同步若存在失败标的，不得把 auto_sync_last_date 误标为今日已完成
+    monkeypatch.setattr(sync, "_get_universe_for_sync", lambda day_str: ([("sh.601091", "次新测试")], day_str, "mock"))
+    monkeypatch.setattr(
+        sync,
+        "update_cache",
+        lambda *a, **k: {"updated": 0, "skipped": 0, "failed": 5, "effective_end": "2026-11-25", "source": "mock"},
+    )
+    mgr = sync.AutoSyncManager()
+    mgr._execute_sync(trigger_label="测试")
+    assert db._setting_get("auto_sync_last_date", "") == ""
