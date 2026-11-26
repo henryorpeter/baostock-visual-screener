@@ -2147,6 +2147,7 @@
 
   function renderCacheStatus(status, autoSync, timesList) {
     if (status) {
+      if (state.bootstrap) state.bootstrap.status = status;
       const shortDate = status.newest ? status.newest.slice(5) : "--";
       $("navStatusText").textContent = `${(status.stocks || 0).toLocaleString()} 只 · ${shortDate}`;
       $("kpiStocks").textContent = (status.stocks || 0).toLocaleString();
@@ -2154,6 +2155,7 @@
       $("kpiNewest").textContent = status.newest || "--";
       $("kpiSize").textContent = status.size_mb !== undefined ? `${Number(status.size_mb).toFixed(1)} MB` : "--";
       $("cacheDbPath").textContent = status.db_name ? `本地库文件：${status.db_name}` : "";
+      updateStrategyCountUI();
     }
 
     if (timesList && $("autoSyncTime").options.length === 0) {

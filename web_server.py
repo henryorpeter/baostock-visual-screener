@@ -13,6 +13,7 @@ import re
 import sys
 import threading
 import time
+import traceback
 from urllib.parse import urlparse
 import webbrowser
 
@@ -413,8 +414,8 @@ async def api_screen_stream(request):
             else:
                 _emit({"type": "result", "data": data})
         except Exception as exc:
-            print(f"[web_server] screen worker error: {exc}", file=sys.stderr)
-            _emit({"type": "error", "error": "选股计算发生内部异常，请稍后重试", "status": 500})
+            print(f"[web_server] screen worker error: {exc}\n{traceback.format_exc()}", file=sys.stderr)
+            _emit({"type": "error", "error": f"选股计算发生内部异常（{type(exc).__name__}），请查看启动黑窗日志", "status": 500})
         finally:
             _SCREEN_SEM.release()
             loop.call_soon_threadsafe(queue.put_nowait, None)
@@ -660,6 +661,8 @@ async def api_sync_status(_request):
     local_status["db_name"] = db.CACHE_DB.name
     mgr = sync.get_sync_manager_singleton()
     state = mgr.snapshot(local_status=local_status)
+    if not state.get("running") and local_status.get("stocks", 0) > 0:
+        _get_universe_cached(force=not _UNIVERSE_CACHE["data"])
     return JSONResponse({"status": local_status, "auto_sync": state})
 
 

@@ -599,6 +599,36 @@ def test_intraday_minute_api_and_live_ticker_sync(isolated_db, monkeypatch):
     assert kl["ticker"]["close"] == 14.47 and kl["ticker"]["date"] == today_iso
 
 
+def test_load_market_arrays_resilient_to_dirty_sqlite_and_zero_prices(isolated_db):
+    df = _make_ohlcv(n=130, seed=19, code="sh.600123")
+    db._cache_write(df)
+    # 模拟异常脏数据：某行 turn/pctChg 存成空字符串 ""，以及某日复权价为 0.0
+    with db.connect(timeout=30) as conn:
+        conn.execute(
+            "UPDATE daily SET turn = '', pctChg = '' WHERE code = 'sh.600123' AND date = ?",
+            (df["date"].iloc[5].strftime("%Y-%m-%d"),),
+        )
+        conn.execute(
+            "UPDATE daily SET close = 0.0, low = 0.0 WHERE code = 'sh.600123' AND date = ?",
+            (df["date"].iloc[8].strftime("%Y-%m-%d"),),
+        )
+    engine._ARRAY_CACHE.clear()
+    rows, newest, rev = db._cache_version()
+    frames = engine.load_market_arrays("2025-01-01", "2027-01-01", rows, newest, rev)
+    assert "sh.600123" in frames
+    # 全 20 套策略扫描不应因空字符串或 0 价格抛出异常
+    res, stats = engine.screen(
+        [("sh.600123", "测试脏数据股")],
+        frames,
+        list(engine.STRATEGIES.keys()),
+        min_change=-20.0,
+        min_turn=0.0,
+        max_turn=100.0,
+        on_progress=lambda *a, **k: None,
+    )
+    assert stats["ready"] == 1
+
+
 # ==================== 6. Legacy AppTest E2E smoke tests ====================
 
 @pytest.mark.parametrize("entry_file", ["app.py", "baostock_screener.py"])

@@ -16,14 +16,14 @@ _ARRAY_CACHE = OrderedDict()
 
 
 def load_market_arrays(start, end, db_rows, db_newest, db_rev="0"):
-    """纯 Python 线程安全 LRU 缓存版全市场 NumPy 数组加载（不依赖 Streamlit 运行时）。"""
+    """纯 Python 线程安全 LRU 缓存版全市场 NumPy 数组加载（不依赖 Streamlit 装饰器内部属性）。"""
     key = (start, end, db_rows, db_newest, db_rev)
     with _ARRAY_CACHE_LOCK:
         cached = _ARRAY_CACHE.get(key)
         if cached is not None:
             _ARRAY_CACHE.move_to_end(key)
             return cached
-    data = _load_market_arrays_cached.__wrapped__(start, end, db_rows, db_newest, db_rev)
+    data = _load_market_arrays_raw(start, end)
     with _ARRAY_CACHE_LOCK:
         _ARRAY_CACHE[key] = data
         _ARRAY_CACHE.move_to_end(key)
@@ -94,9 +94,27 @@ STRATEGY_TO_GROUP = {
 
 
 
-@st.cache_resource(max_entries=3, show_spinner=False)
-def _load_market_arrays_cached(start, end, db_rows, db_newest, db_rev="0"):
-    """一次性从 SQLite 载入全市场行情并按股票拆分为只读 NumPy 数组字典（带版本感知内存缓存）。"""
+def _to_float64_arr(buf):
+    """高速转换为只读 float64 数组；遇到 SQLite 中残留的空字符串/非法文本自动安全回退为 NaN。"""
+    try:
+        arr = np.asarray(buf, dtype=np.float64)
+    except (ValueError, TypeError):
+        cleaned = []
+        for v in buf:
+            if v is None or v == "":
+                cleaned.append(np.nan)
+            else:
+                try:
+                    cleaned.append(float(v))
+                except (ValueError, TypeError):
+                    cleaned.append(np.nan)
+        arr = np.asarray(cleaned, dtype=np.float64)
+    arr.setflags(write=False)
+    return arr
+
+
+def _load_market_arrays_raw(start, end):
+    """一次性从 SQLite 载入全市场行情并按股票拆分为只读 NumPy 数组字典（纯 Python，无 Streamlit 依赖）。"""
     db._init_cache()
     with db.connect(timeout=30) as conn:
         rows = conn.execute(
@@ -115,11 +133,9 @@ def _load_market_arrays_cached(start, end, db_rows, db_newest, db_rev="0"):
         if not cur_code or not c_buf:
             return
         arrs = tuple(
-            np.asarray(buf, dtype=np.float64)
+            _to_float64_arr(buf)
             for buf in (o_buf, h_buf, l_buf, c_buf, v_buf, a_buf, t_buf, p_buf)
         )
-        for arr in arrs:
-            arr.setflags(write=False)
         market[cur_code] = (tuple(d_buf), *arrs)
 
     for code, dt, op, hi, lo, cl, vol, amt, turn, pct in rows:
@@ -138,6 +154,11 @@ def _load_market_arrays_cached(start, end, db_rows, db_newest, db_rev="0"):
         p_buf.append(pct)
     _flush()
     return market
+
+
+@st.cache_resource(max_entries=3, show_spinner=False)
+def _load_market_arrays_cached(start, end, db_rows, db_newest, db_rev="0"):
+    return _load_market_arrays_raw(start, end)
 
 
 def _limit_pct_threshold(code):
@@ -300,6 +321,7 @@ def _eval_strategies_np(feat, strategies, limit_pct=9.5):
             ok = (
                 recent_limit
                 and len(c) >= 6
+                and c[-1] > 0
                 and (np.std(c[-5:], ddof=1) / c[-1] < 0.04)
                 and c[-1] > np.nanmax(h[-6:-1])
             )
@@ -337,7 +359,8 @@ def _eval_strategies_np(feat, strategies, limit_pct=9.5):
             ok = (h[-1] - max(o[-1], c[-1])) > abs(c[-1] - o[-1]) * 1.8 and c[-1] > ma20[-1]
         elif name == "W底策略":
             ok = (
-                l[-10:-5].size > 0
+                c[-1] > 0
+                and l[-10:-5].size > 0
                 and l[-5:-1].size > 0
                 and h[-10:-1].size > 0
                 and abs(np.nanmin(l[-10:-5]) - np.nanmin(l[-5:-1])) / c[-1] < 0.04
@@ -362,13 +385,15 @@ def _eval_strategies_np(feat, strategies, limit_pct=9.5):
                 and c[-1] > c[-2]
             )
         elif name == "高旗形整理策略":
+            min_l40 = np.nanmin(l[-40:]) if l[-40:].size > 0 else np.nan
+            min_l10 = np.nanmin(l[-10:]) if l[-10:].size > 0 else np.nan
             ok = (
-                l[-40:].size > 0
-                and l[-10:].size > 0
+                min_l40 > 0
+                and min_l10 > 0
                 and v[-21:-1].size > 0
-                and np.nanmax(h[-40:]) / np.nanmin(l[-40:]) > 1.6
-                and np.nanmax(h[-10:]) / np.nanmin(l[-10:]) < 1.15
-                and np.nanmin(l[-10:]) >= np.nanmax(h[-40:]) * 0.8
+                and np.nanmax(h[-40:]) / min_l40 > 1.6
+                and np.nanmax(h[-10:]) / min_l10 < 1.15
+                and min_l10 >= np.nanmax(h[-40:]) * 0.8
                 and v[-1] < np.nanmean(v[-21:-1]) * 0.6
             )
         elif name == "涨停洗盘策略":
@@ -530,8 +555,12 @@ def screen(
         if rps_pool:
             _emit(0.96, stage=3, detail=f"正在对 {len(rps_pool):,} 只标的执行 120 日 RPS 相对强度排名…",
                   hits=len(rows), scanned=total_codes, total=total_codes)
-            returns = pd.Series({code: vals[1][-1] / vals[1][-121] - 1.0 for code, vals in rps_pool.items()})
-            ranks = returns.rank(pct=True) * 100.0
+            returns = pd.Series({
+                code: vals[1][-1] / vals[1][-121] - 1.0
+                for code, vals in rps_pool.items()
+                if np.isfinite(vals[1][-1]) and np.isfinite(vals[1][-121]) and vals[1][-121] > 0
+            })
+            ranks = returns.rank(pct=True) * 100.0 if not returns.empty else pd.Series(dtype=float)
             for code, rank in ranks.items():
                 name, c, h, last_close, last_turn, last_pct, last_amt = rps_pool[code]
                 breakout = last_close >= float(np.nanmax(h[-120:])) * 0.9
